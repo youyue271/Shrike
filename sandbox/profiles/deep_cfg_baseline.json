@@ -1,0 +1,15 @@
+{
+  "profile_name": "deep_cfg_baseline",
+  "trace_mode": "dynamic_cfg",
+  "trace_backend": "placeholder",
+  "network_mode": "airgap",
+  "user_simulation": "none",
+  "execution_window_seconds": 180,
+  "boot_stabilization_seconds": 30,
+  "capture": {
+    "cfg": true,
+    "dfg": false,
+    "memory_writes": true,
+    "register_snapshots": false
+  }
+}

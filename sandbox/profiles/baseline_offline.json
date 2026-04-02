@@ -1,0 +1,9 @@
+{
+  "profile_name": "baseline_offline",
+  "trace_mode": "none",
+  "trace_backend": "none",
+  "network_mode": "airgap",
+  "user_simulation": "none",
+  "execution_window_seconds": 120,
+  "boot_stabilization_seconds": 30
+}

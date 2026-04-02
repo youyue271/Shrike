@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         default="sandbox_data/task_media/sample-task.iso",
         help="Sample ISO path relative to the project root unless absolute.",
     )
+    parser.add_argument(
+        "--task-profile",
+        default=None,
+        help="Optional JSON task profile to stage into the sample ISO.",
+    )
     return parser.parse_args()
 
 
@@ -93,9 +98,13 @@ def main() -> int:
     sample_path = resolve_path(root, args.sample)
     artifact_disk = resolve_path(root, args.artifact_disk)
     sample_iso = resolve_path(root, args.sample_iso)
+    task_profile = resolve_path(root, args.task_profile) if args.task_profile else None
 
     if not sample_path.exists():
         print(f"ERROR: sample not found: {sample_path}", file=sys.stderr)
+        return 1
+    if task_profile and not task_profile.exists():
+        print(f"ERROR: task profile not found: {task_profile}", file=sys.stderr)
         return 1
 
     build_iso_script = root / "sandbox" / "scripts" / "build_sample_iso.py"
@@ -111,6 +120,14 @@ def main() -> int:
             str(sample_path),
             "--output",
             str(sample_iso),
+            *(
+                [
+                    "--task-profile",
+                    str(task_profile),
+                ]
+                if task_profile
+                else []
+            ),
         ],
         cwd=root,
     )
@@ -145,6 +162,8 @@ def main() -> int:
     print("Task completed.")
     print(f"Sample ISO: {sample_iso}")
     print(f"Artifact disk: {artifact_disk}")
+    if task_profile:
+        print(f"Task profile: {task_profile}")
     print("If you finish inspecting the mounted artifact disk on Windows, dismount it with PowerShell:")
     print(
         f'Dismount-VHD -Path "{wsl_to_windows(artifact_disk)}"'

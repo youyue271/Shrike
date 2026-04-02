@@ -5,6 +5,7 @@ $localOutputRoot = "C:\Sandbox\output"
 $executionWindowSeconds = 120
 $mediaWaitTimeoutSeconds = 90
 $mediaPollIntervalSeconds = 3
+$bootStabilizationSeconds = 30
 
 New-Item -ItemType Directory -Force $localOutputRoot | Out-Null
 Set-Content -Path $runnerLog -Value ""
@@ -23,6 +24,11 @@ function Export-JsonFile {
         [Parameter(Mandatory = $true)]
         [string]$Path
     )
+
+    if (($InputObject -is [System.Collections.IEnumerable]) -and -not ($InputObject -is [string]) -and @($InputObject).Count -eq 0) {
+        Set-Content -Path $Path -Value "[]" -Encoding UTF8
+        return
+    }
 
     $InputObject | ConvertTo-Json -Depth 8 | Set-Content -Path $Path -Encoding UTF8
 }
@@ -216,6 +222,98 @@ function Export-SysmonCategory {
     Write-RunnerLog ("exported {0}.json with {1} events" -f $BaseName, $objects.Count)
 }
 
+function Get-SysmonDataValue {
+    param(
+        [System.Diagnostics.Eventing.Reader.EventRecord]$Event,
+        [string]$Name
+    )
+
+    try {
+        $xml = [xml]$Event.ToXml()
+        foreach ($node in $xml.Event.EventData.Data) {
+            if ($node.Name -eq $Name) {
+                return $node.'#text'
+            }
+        }
+    } catch {}
+
+    return $null
+}
+
+function Get-RecentSysmonEvents {
+    param([int]$MaxEvents = 16384)
+
+    try {
+        return @(Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents $MaxEvents -ErrorAction Stop)
+    } catch {
+        Write-RunnerLog ("recent sysmon query failed: {0}" -f $_.Exception.Message)
+        return @()
+    }
+}
+
+function Get-SysmonEventsInWindow {
+    param(
+        [array]$Events,
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd
+    )
+
+    return @(
+        $Events | Where-Object {
+            $_.TimeCreated -and $_.TimeCreated -ge $WindowStart -and $_.TimeCreated -le $WindowEnd
+        }
+    )
+}
+
+function Get-SampleRelatedSysmonEvents {
+    param(
+        [array]$Events,
+        [string]$SampleName,
+        [int]$LaunchedPid
+    )
+
+    $sampleStem = [System.IO.Path]::GetFileNameWithoutExtension($SampleName).ToLowerInvariant()
+    return @(
+        $Events | Where-Object {
+            $fields = @(
+                (Get-SysmonDataValue -Event $_ -Name "Image"),
+                (Get-SysmonDataValue -Event $_ -Name "ParentImage"),
+                (Get-SysmonDataValue -Event $_ -Name "TargetFilename"),
+                (Get-SysmonDataValue -Event $_ -Name "TargetObject"),
+                (Get-SysmonDataValue -Event $_ -Name "QueryName"),
+                (Get-SysmonDataValue -Event $_ -Name "SourceImage"),
+                (Get-SysmonDataValue -Event $_ -Name "TargetImage"),
+                (Get-SysmonDataValue -Event $_ -Name "CommandLine")
+            ) | Where-Object { $_ }
+
+            $textMatch = $false
+            foreach ($field in $fields) {
+                if ($field.ToString().ToLowerInvariant().Contains($sampleStem)) {
+                    $textMatch = $true
+                    break
+                }
+            }
+
+            $pidFields = @(
+                (Get-SysmonDataValue -Event $_ -Name "ProcessId"),
+                (Get-SysmonDataValue -Event $_ -Name "ParentProcessId"),
+                (Get-SysmonDataValue -Event $_ -Name "SourceProcessId"),
+                (Get-SysmonDataValue -Event $_ -Name "TargetProcessId")
+            ) | Where-Object { $_ }
+
+            $pidMatch = $false
+            foreach ($pidField in $pidFields) {
+                if ($pidField -eq $LaunchedPid.ToString()) {
+                    $pidMatch = $true
+                    break
+                }
+            }
+
+            return $textMatch -or $pidMatch
+        }
+    )
+}
+
 function Find-OfflineTaskMedia {
     $sampleDrive = $null
     $artifactDrive = $null
@@ -257,6 +355,134 @@ function Wait-ForOfflineTaskMedia {
     return Find-OfflineTaskMedia
 }
 
+function Wait-ForBootStabilization {
+    param([int]$Seconds)
+
+    if ($Seconds -le 0) {
+        return
+    }
+
+    Write-RunnerLog ("waiting {0} seconds for post-boot stabilization before pre snapshot" -f $Seconds)
+    Start-Sleep -Seconds $Seconds
+}
+
+function Import-TaskProfile {
+    param([string]$SampleDrive)
+
+    $taskProfilePath = Join-Path $SampleDrive "task\task_profile.json"
+    if (-not (Test-Path $taskProfilePath)) {
+        return $null
+    }
+
+    try {
+        $content = Get-Content -Path $taskProfilePath -Raw -Encoding UTF8
+        return $content | ConvertFrom-Json
+    } catch {
+        throw ("failed to parse task profile: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Get-TaskProfileValue {
+    param(
+        $TaskProfile,
+        [string]$Name,
+        $Default = $null
+    )
+
+    if ($null -eq $TaskProfile) {
+        return $Default
+    }
+
+    $prop = $TaskProfile.PSObject.Properties[$Name]
+    if ($null -eq $prop) {
+        return $Default
+    }
+
+    return $prop.Value
+}
+
+function Export-TraceArtifacts {
+    param(
+        $TaskProfile,
+        $TaskRuntimeContext,
+        [string]$ArtifactDir,
+        [string]$SampleName,
+        [int]$LaunchedPid,
+        [datetime]$StartedAt,
+        [datetime]$EndedAt
+    )
+
+    $traceMode = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "trace_mode" -Default "none"
+    $traceBackend = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "trace_backend" -Default "none"
+    $capture = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "capture" -Default @{}
+    $backendOptions = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "backend_options" -Default @{}
+
+    $traceRequest = [ordered]@{
+        profile_name = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "profile_name" -Default "default"
+        trace_mode = $traceMode
+        trace_backend = $traceBackend
+        capture = $capture
+        backend_options = $backendOptions
+        sample_name = $SampleName
+        launched_pid = $LaunchedPid
+        started_at = $StartedAt.ToString("o")
+        ended_at = $EndedAt.ToString("o")
+    }
+    Export-JsonFile -InputObject $traceRequest -Path (Join-Path $ArtifactDir "trace_request.json")
+    Write-RunnerLog "exported trace_request.json"
+
+    $expectedArtifacts = @("trace_request.json", "trace_manifest.json")
+    $collectedArtifacts = @("trace_request.json")
+    $traceStatus = "disabled"
+    $traceReason = "task profile requested no deep trace backend"
+
+    if ($traceMode -eq "none") {
+    } else {
+        $traceStatus = "placeholder_not_implemented"
+        $traceReason = "trace profile propagated end-to-end, but no collector backend is wired into the guest runtime yet"
+
+        if ($traceMode -eq "dynamic_cfg") {
+            $expectedArtifacts += @("dynamic_cfg_trace_summary.json", "dynamic_cfg_trace.ndjson")
+
+            $dynamicCfgSummary = [ordered]@{
+                trace_mode = $traceMode
+                trace_backend = $traceBackend
+                status = $traceStatus
+                sample_name = $SampleName
+                launched_pid = $LaunchedPid
+                started_at = $StartedAt.ToString("o")
+                ended_at = $EndedAt.ToString("o")
+                basic_block_count = 0
+                edge_count = 0
+                module_count = 0
+                modules = @()
+                notes = @(
+                    "This profile now requests dynamic CFG capture.",
+                    "A real backend still needs to be integrated in the dev branch.",
+                    "The intended future artifact is dynamic_cfg_trace.ndjson."
+                )
+            }
+            Export-JsonFile -InputObject $dynamicCfgSummary -Path (Join-Path $ArtifactDir "dynamic_cfg_trace_summary.json")
+            Export-JsonFile -InputObject @() -Path (Join-Path $ArtifactDir "dynamic_cfg_trace.ndjson")
+            $collectedArtifacts += @("dynamic_cfg_trace_summary.json", "dynamic_cfg_trace.ndjson")
+            Write-RunnerLog "exported dynamic_cfg trace placeholder artifacts"
+        }
+    }
+
+    $collectedArtifacts += "trace_manifest.json"
+    $traceManifest = [ordered]@{
+        trace_mode = $traceMode
+        trace_backend = $traceBackend
+        status = $traceStatus
+        reason = $traceReason
+        expected_artifacts = $expectedArtifacts
+        collected_artifacts = $collectedArtifacts
+        runtime_context = $TaskRuntimeContext
+    }
+    Export-JsonFile -InputObject $traceManifest -Path (Join-Path $ArtifactDir "trace_manifest.json")
+    Write-RunnerLog "exported trace_manifest.json"
+}
+
 try {
     Write-RunnerLog "task start"
 
@@ -273,12 +499,37 @@ try {
         exit 0
     }
 
+    $taskProfile = Import-TaskProfile -SampleDrive $sampleDrive
+    if ($taskProfile) {
+        $profileName = Get-TaskProfileValue -TaskProfile $taskProfile -Name "profile_name" -Default "unnamed"
+        $traceMode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_mode" -Default "none"
+        $traceBackend = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_backend" -Default "none"
+        $networkMode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "network_mode" -Default "airgap"
+        $userSimulation = Get-TaskProfileValue -TaskProfile $taskProfile -Name "user_simulation" -Default "none"
+        Write-RunnerLog ("loaded task profile name={0} trace_mode={1} trace_backend={2} network_mode={3} user_simulation={4}" -f $profileName, $traceMode, $traceBackend, $networkMode, $userSimulation)
+
+        $profileExecutionWindowSeconds = Get-TaskProfileValue -TaskProfile $taskProfile -Name "execution_window_seconds" -Default $executionWindowSeconds
+        if ($profileExecutionWindowSeconds) {
+            $executionWindowSeconds = [int]$profileExecutionWindowSeconds
+        }
+
+        $profileBootStabilizationSeconds = Get-TaskProfileValue -TaskProfile $taskProfile -Name "boot_stabilization_seconds" -Default $bootStabilizationSeconds
+        if ($profileBootStabilizationSeconds -or $profileBootStabilizationSeconds -eq 0) {
+            $bootStabilizationSeconds = [int]$profileBootStabilizationSeconds
+        }
+    } else {
+        Write-RunnerLog "no task profile present on sample media; using built-in defaults"
+    }
+
+    Wait-ForBootStabilization -Seconds $bootStabilizationSeconds
+
     $sampleDir = Join-Path $sampleDrive "sample"
     $artifactDir = Join-Path $artifactDrive "artifact"
     $localInput = "C:\Sandbox\input"
 
     New-Item -ItemType Directory -Force $localInput | Out-Null
     New-Item -ItemType Directory -Force $artifactDir | Out-Null
+    Get-ChildItem -Path $localInput -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
     Export-SnapshotBundle -Prefix "pre" -ArtifactDir $artifactDir
 
@@ -326,19 +577,53 @@ try {
     Export-JsonFile -InputObject $sampleMetadata -Path (Join-Path $artifactDir "sample_metadata.json")
     Write-RunnerLog "exported sample_metadata.json"
 
+    if ($taskProfile) {
+        Export-JsonFile -InputObject $taskProfile -Path (Join-Path $artifactDir "task_profile.json")
+        Write-RunnerLog "exported task_profile.json"
+    }
+
+    $taskRuntimeContext = [ordered]@{
+        execution_window_seconds = $executionWindowSeconds
+        boot_stabilization_seconds = $bootStabilizationSeconds
+        trace_mode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_mode" -Default "none"
+        trace_backend = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_backend" -Default "none"
+        network_mode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "network_mode" -Default "airgap"
+        user_simulation = Get-TaskProfileValue -TaskProfile $taskProfile -Name "user_simulation" -Default "none"
+        profile_name = Get-TaskProfileValue -TaskProfile $taskProfile -Name "profile_name" -Default "default"
+    }
+    Export-JsonFile -InputObject $taskRuntimeContext -Path (Join-Path $artifactDir "task_runtime_context.json")
+    Write-RunnerLog "exported task_runtime_context.json"
+
+    Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -LaunchedPid $proc.Id -StartedAt $start -EndedAt $end
+
     $windowStart = $start.AddSeconds(-10)
     $windowEnd = $end.AddSeconds(10)
-    try {
-        $sysmonEvents = @(Get-WinEvent -FilterHashtable @{
-            LogName = "Microsoft-Windows-Sysmon/Operational"
-            StartTime = $windowStart
-            EndTime = $windowEnd
-        } -ErrorAction Stop)
+    $recentSysmonEvents = Get-RecentSysmonEvents -MaxEvents 16384
+    Write-RunnerLog ("collected {0} recent sysmon events from live log" -f $recentSysmonEvents.Count)
+
+    $sysmonEvents = Get-SysmonEventsInWindow -Events $recentSysmonEvents -WindowStart $windowStart -WindowEnd $windowEnd
+    if ($sysmonEvents.Count -gt 0) {
         Write-RunnerLog ("collected {0} sysmon events in time window" -f $sysmonEvents.Count)
-    } catch {
-        $sysmonEvents = @()
-        Write-RunnerLog ("sysmon query failed: {0}" -f $_.Exception.Message)
+    } else {
+        $sysmonEvents = Get-SampleRelatedSysmonEvents -Events $recentSysmonEvents -SampleName $sample.Name -LaunchedPid $proc.Id
+        if ($sysmonEvents.Count -gt 0) {
+            Write-RunnerLog ("time-window sysmon query returned 0 events; fallback sample-related query collected {0} events" -f $sysmonEvents.Count)
+        } else {
+            Write-RunnerLog "sysmon query failed: no events found in time window or sample-related fallback query"
+        }
     }
+
+    Export-JsonFile -InputObject @(
+        [PSCustomObject]@{
+            recent_event_count = $recentSysmonEvents.Count
+            selected_event_count = $sysmonEvents.Count
+            window_start = $windowStart.ToString("o")
+            window_end = $windowEnd.ToString("o")
+            sample_name = $sample.Name
+            launched_pid = $proc.Id
+        }
+    ) -Path (Join-Path $artifactDir "sysmon_diagnostic.json")
+    Write-RunnerLog "exported sysmon_diagnostic.json"
 
     $sysmonSummary = $sysmonEvents |
         Group-Object Id |

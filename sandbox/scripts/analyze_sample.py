@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Push the current guest runtime and Sysmon config into the running guest before analysis.",
     )
+    parser.add_argument(
+        "--task-profile",
+        default=None,
+        help="Optional JSON task profile to stage into the sample ISO for this run.",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +98,8 @@ def main() -> int:
         "--timeout-seconds",
         str(args.timeout_seconds),
     ]
+    if args.task_profile:
+        run_cmd.extend(["--task-profile", args.task_profile])
     run(run_cmd, cwd=root)
 
     collect_cmd = [
