@@ -15,6 +15,7 @@ TRACE_ARTIFACTS_BY_MODE: dict[str, list[str]] = {
         TRACE_MANIFEST_ARTIFACT,
         "dynamic_cfg_trace_summary.json",
         "dynamic_cfg_trace.ndjson",
+        "trace_backend_diagnostic.json",
     ],
 }
 

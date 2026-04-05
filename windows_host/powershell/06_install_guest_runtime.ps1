@@ -2,6 +2,7 @@ param(
     [string]$VmName = "rw-sandbox-win10",
     [string]$GuestUser = "analyst",
     [string]$RuntimeSourcePath = "guest\runtime\run_task.ps1",
+    [string]$TraceBackendPlaceholderSourcePath = "guest\runtime\trace_backend_placeholder.ps1",
     [string]$SysmonConfigSourcePath = "guest\runtime\sysmon_config.xml",
     [string]$SysmonBinarySourcePath = "windows_host\sysmon\sysmon64.exe",
     [string]$TaskName = "SandboxRunTask"
@@ -12,6 +13,7 @@ param(
 $repoRoot = Resolve-RepoRoot
 $logPath = New-LogFilePath -ScriptName "06_install_guest_runtime" -RepoRoot $repoRoot
 $RuntimeSourcePath = Resolve-ProjectPath -Path $RuntimeSourcePath -RepoRoot $repoRoot
+$TraceBackendPlaceholderSourcePath = Resolve-ProjectPath -Path $TraceBackendPlaceholderSourcePath -RepoRoot $repoRoot
 $SysmonConfigSourcePath = Resolve-ProjectPath -Path $SysmonConfigSourcePath -RepoRoot $repoRoot
 $SysmonBinarySourcePath = Resolve-ProjectPath -Path $SysmonBinarySourcePath -RepoRoot $repoRoot
 
@@ -21,6 +23,9 @@ try {
 
     if (-not (Test-Path $RuntimeSourcePath)) {
         throw "Guest runtime source file not found: $RuntimeSourcePath"
+    }
+    if (-not (Test-Path $TraceBackendPlaceholderSourcePath)) {
+        throw "Trace backend placeholder source file not found: $TraceBackendPlaceholderSourcePath"
     }
     if (-not (Test-Path $SysmonConfigSourcePath)) {
         throw "Sysmon config source file not found: $SysmonConfigSourcePath"
@@ -32,6 +37,7 @@ try {
     }
 
     $scriptContent = Get-Content -Path $RuntimeSourcePath -Raw -Encoding UTF8
+    $traceBackendPlaceholderContent = Get-Content -Path $TraceBackendPlaceholderSourcePath -Raw -Encoding UTF8
     $sysmonConfigContent = Get-Content -Path $SysmonConfigSourcePath -Raw -Encoding UTF8
     $sysmonBinaryBase64 = $null
     if (Test-Path $SysmonBinarySourcePath) {
@@ -41,12 +47,13 @@ try {
         Write-Log -Message ("Sysmon binary source not found at {0}. Will only try to reconfigure an existing in-guest Sysmon install." -f $SysmonBinarySourcePath) -LogPath $logPath -Level "WARN"
     }
     Write-Log -Message ("Loaded guest runtime source: {0}" -f $RuntimeSourcePath) -LogPath $logPath
+    Write-Log -Message ("Loaded trace backend placeholder source: {0}" -f $TraceBackendPlaceholderSourcePath) -LogPath $logPath
     Write-Log -Message ("Loaded Sysmon config source: {0}" -f $SysmonConfigSourcePath) -LogPath $logPath
 
     $credential = Get-Credential -UserName $GuestUser -Message "Enter guest credentials for PowerShell Direct"
 
     $result = Invoke-Command -VMName $VmName -Credential $credential -ScriptBlock {
-        param($Content, $SysmonConfigContent, $SysmonBinaryBase64, $ScheduledTaskName)
+        param($Content, $TraceBackendPlaceholderContent, $SysmonConfigContent, $SysmonBinaryBase64, $ScheduledTaskName)
 
         function Invoke-NativeCommandSafe {
             param(
@@ -84,6 +91,7 @@ try {
         New-Item -ItemType Directory -Force "C:\Sandbox\sysmon" | Out-Null
 
         Set-Content -Path "C:\Sandbox\runtime\run_task.ps1" -Value $Content -Encoding UTF8
+        Set-Content -Path "C:\Sandbox\runtime\trace_backend_placeholder.ps1" -Value $TraceBackendPlaceholderContent -Encoding UTF8
         Set-Content -Path "C:\Sandbox\runtime\sysmon_config.xml" -Value $SysmonConfigContent -Encoding UTF8
 
         $projectSysmonPath = "C:\Sandbox\sysmon\sysmon64.exe"
@@ -95,6 +103,11 @@ try {
 
         $null = [System.Management.Automation.Language.Parser]::ParseFile(
             "C:\Sandbox\runtime\run_task.ps1",
+            [ref]$null,
+            [ref]$null
+        )
+        $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            "C:\Sandbox\runtime\trace_backend_placeholder.ps1",
             [ref]$null,
             [ref]$null
         )
@@ -185,6 +198,7 @@ try {
 
         [PSCustomObject]@{
             RuntimePath = "C:\Sandbox\runtime\run_task.ps1"
+            TraceBackendPlaceholderPath = "C:\Sandbox\runtime\trace_backend_placeholder.ps1"
             SysmonConfigPath = "C:\Sandbox\runtime\sysmon_config.xml"
             TaskName = $ScheduledTaskName
             RuntimeSize = (Get-Item "C:\Sandbox\runtime\run_task.ps1").Length
@@ -200,9 +214,10 @@ try {
             SysmonCommandStdErr = $sysmonCommandStdErr
             SysmonMessage = $sysmonMessage
         }
-    } -ArgumentList $scriptContent, $sysmonConfigContent, $sysmonBinaryBase64, $TaskName
+    } -ArgumentList $scriptContent, $traceBackendPlaceholderContent, $sysmonConfigContent, $sysmonBinaryBase64, $TaskName
 
     Write-Log -Message ("Installed guest runtime to {0}" -f $result.RuntimePath) -LogPath $logPath
+    Write-Log -Message ("Installed trace backend placeholder to {0}" -f $result.TraceBackendPlaceholderPath) -LogPath $logPath
     Write-Log -Message ("Installed Sysmon config to {0}" -f $result.SysmonConfigPath) -LogPath $logPath
     Write-Log -Message ("Registered startup task {0}" -f $result.TaskName) -LogPath $logPath
     Write-Log -Message ("Guest runtime size={0} bytes, lastWriteTime={1}" -f $result.RuntimeSize, $result.LastWriteTime) -LogPath $logPath

@@ -33,6 +33,34 @@ function Export-JsonFile {
     $InputObject | ConvertTo-Json -Depth 8 | Set-Content -Path $Path -Encoding UTF8
 }
 
+function Invoke-NativeCommandSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ArgumentList = @()
+    )
+
+    $tempOut = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString() + ".out.txt")
+    $tempErr = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString() + ".err.txt")
+    try {
+        $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr
+
+        $stdout = if (Test-Path $tempOut) { Get-Content -Path $tempOut -Raw -ErrorAction SilentlyContinue } else { "" }
+        $stderr = if (Test-Path $tempErr) { Get-Content -Path $tempErr -Raw -ErrorAction SilentlyContinue } else { "" }
+
+        return [PSCustomObject]@{
+            ExitCode = $proc.ExitCode
+            StdOut = ($stdout | Out-String).Trim()
+            StdErr = ($stderr | Out-String).Trim()
+        }
+    } finally {
+        Remove-Item -Path $tempOut, $tempErr -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Export-ProcessSnapshot {
     param([string]$Path)
 
@@ -407,6 +435,7 @@ function Export-TraceArtifacts {
         $TaskRuntimeContext,
         [string]$ArtifactDir,
         [string]$SampleName,
+        [string]$SamplePath,
         [int]$LaunchedPid,
         [datetime]$StartedAt,
         [datetime]$EndedAt
@@ -424,6 +453,7 @@ function Export-TraceArtifacts {
         capture = $capture
         backend_options = $backendOptions
         sample_name = $SampleName
+        sample_path = $SamplePath
         launched_pid = $LaunchedPid
         started_at = $StartedAt.ToString("o")
         ended_at = $EndedAt.ToString("o")
@@ -435,38 +465,83 @@ function Export-TraceArtifacts {
     $collectedArtifacts = @("trace_request.json")
     $traceStatus = "disabled"
     $traceReason = "task profile requested no deep trace backend"
+    $backendDiagnostic = [ordered]@{
+        command = $null
+        exit_code = $null
+        stdout = ""
+        stderr = ""
+    }
 
-    if ($traceMode -eq "none") {
-    } else {
-        $traceStatus = "placeholder_not_implemented"
-        $traceReason = "trace profile propagated end-to-end, but no collector backend is wired into the guest runtime yet"
+    if ($traceMode -ne "none") {
+        $expectedArtifacts += @("dynamic_cfg_trace_summary.json", "dynamic_cfg_trace.ndjson", "trace_backend_diagnostic.json")
 
-        if ($traceMode -eq "dynamic_cfg") {
-            $expectedArtifacts += @("dynamic_cfg_trace_summary.json", "dynamic_cfg_trace.ndjson")
+        $traceOutputPath = Join-Path $ArtifactDir "dynamic_cfg_trace.ndjson"
+        $traceSummaryPath = Join-Path $ArtifactDir "dynamic_cfg_trace_summary.json"
+        $traceDiagnosticPath = Join-Path $ArtifactDir "trace_backend_diagnostic.json"
 
-            $dynamicCfgSummary = [ordered]@{
-                trace_mode = $traceMode
-                trace_backend = $traceBackend
-                status = $traceStatus
-                sample_name = $SampleName
-                launched_pid = $LaunchedPid
-                started_at = $StartedAt.ToString("o")
-                ended_at = $EndedAt.ToString("o")
-                basic_block_count = 0
-                edge_count = 0
-                module_count = 0
-                modules = @()
-                notes = @(
-                    "This profile now requests dynamic CFG capture.",
-                    "A real backend still needs to be integrated in the dev branch.",
-                    "The intended future artifact is dynamic_cfg_trace.ndjson."
+        if ($traceMode -eq "dynamic_cfg" -and $traceBackend -eq "placeholder") {
+            $placeholderBackendScript = "C:\Sandbox\runtime\trace_backend_placeholder.ps1"
+            if (-not (Test-Path $placeholderBackendScript)) {
+                $traceStatus = "backend_missing"
+                $traceReason = ("trace backend script not found: {0}" -f $placeholderBackendScript)
+                Write-RunnerLog $traceReason
+            } else {
+                Write-RunnerLog ("invoking trace backend script={0}" -f $placeholderBackendScript)
+                $backendDiagnostic.command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Sandbox\runtime\trace_backend_placeholder.ps1"
+                $backendResult = Invoke-NativeCommandSafe -FilePath "powershell.exe" -ArgumentList @(
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-File", $placeholderBackendScript,
+                    "-RequestPath", (Join-Path $ArtifactDir "trace_request.json"),
+                    "-OutputPath", $traceOutputPath,
+                    "-SummaryPath", $traceSummaryPath
                 )
+                $backendDiagnostic.exit_code = $backendResult.ExitCode
+                $backendDiagnostic.stdout = $backendResult.StdOut
+                $backendDiagnostic.stderr = $backendResult.StdErr
+
+                if ($backendResult.ExitCode -ne 0) {
+                    $traceStatus = "backend_failed"
+                    $traceReason = ("trace backend exited with code {0}" -f $backendResult.ExitCode)
+                    Write-RunnerLog $traceReason
+                    if ($backendResult.StdOut) {
+                        Write-RunnerLog ("trace backend stdout: {0}" -f $backendResult.StdOut)
+                    }
+                    if ($backendResult.StdErr) {
+                        Write-RunnerLog ("trace backend stderr: {0}" -f $backendResult.StdErr)
+                    }
+                } else {
+                    $traceStatus = "completed"
+                    $traceReason = "trace backend completed successfully"
+                    if (Test-Path $traceSummaryPath) {
+                        try {
+                            $backendSummary = Get-Content -Path $traceSummaryPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                            if ($backendSummary.status) {
+                                $traceStatus = [string]$backendSummary.status
+                            }
+                            if ($backendSummary.notes -and $backendSummary.notes.Count -gt 0) {
+                                $traceReason = [string]$backendSummary.notes[0]
+                            }
+                        } catch {
+                            Write-RunnerLog ("trace backend summary parse failed: {0}" -f $_.Exception.Message)
+                        }
+                    }
+                    Write-RunnerLog "trace backend completed"
+                }
             }
-            Export-JsonFile -InputObject $dynamicCfgSummary -Path (Join-Path $ArtifactDir "dynamic_cfg_trace_summary.json")
-            Export-JsonFile -InputObject @() -Path (Join-Path $ArtifactDir "dynamic_cfg_trace.ndjson")
-            $collectedArtifacts += @("dynamic_cfg_trace_summary.json", "dynamic_cfg_trace.ndjson")
-            Write-RunnerLog "exported dynamic_cfg trace placeholder artifacts"
+        } else {
+            $traceStatus = "backend_not_supported"
+            $traceReason = ("unsupported trace backend '{0}' for mode '{1}'" -f $traceBackend, $traceMode)
+            Write-RunnerLog $traceReason
         }
+
+        foreach ($artifactName in @("dynamic_cfg_trace_summary.json", "dynamic_cfg_trace.ndjson")) {
+            if (Test-Path (Join-Path $ArtifactDir $artifactName)) {
+                $collectedArtifacts += $artifactName
+            }
+        }
+        Export-JsonFile -InputObject $backendDiagnostic -Path $traceDiagnosticPath
+        $collectedArtifacts += "trace_backend_diagnostic.json"
     }
 
     $collectedArtifacts += "trace_manifest.json"
@@ -545,26 +620,7 @@ try {
 
     $proc = Start-Process -FilePath $sample.FullName -PassThru
     Write-RunnerLog ("launched sample pid={0}" -f $proc.Id)
-    Start-Sleep -Seconds $executionWindowSeconds
-
-    $end = Get-Date
-    Write-RunnerLog "execution window ended"
-
-    Export-SnapshotBundle -Prefix "post" -ArtifactDir $artifactDir
-
-    try {
-        wevtutil epl Microsoft-Windows-Sysmon/Operational (Join-Path $artifactDir "sysmon.evtx")
-        Write-RunnerLog "exported sysmon.evtx"
-    } catch {
-        Write-RunnerLog ("sysmon export failed: {0}" -f $_.Exception.Message)
-    }
-
-    try {
-        wevtutil epl Microsoft-Windows-PowerShell/Operational (Join-Path $artifactDir "powershell_operational.evtx")
-        Write-RunnerLog "exported powershell_operational.evtx"
-    } catch {
-        Write-RunnerLog ("powershell operational export failed: {0}" -f $_.Exception.Message)
-    }
+    $plannedTraceEnd = $start.AddSeconds($executionWindowSeconds)
 
     $sampleMetadata = [ordered]@{
         sample_name = $sample.Name
@@ -594,7 +650,28 @@ try {
     Export-JsonFile -InputObject $taskRuntimeContext -Path (Join-Path $artifactDir "task_runtime_context.json")
     Write-RunnerLog "exported task_runtime_context.json"
 
-    Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -LaunchedPid $proc.Id -StartedAt $start -EndedAt $end
+    Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd
+
+    Start-Sleep -Seconds $executionWindowSeconds
+
+    $end = Get-Date
+    Write-RunnerLog "execution window ended"
+
+    Export-SnapshotBundle -Prefix "post" -ArtifactDir $artifactDir
+
+    try {
+        wevtutil epl Microsoft-Windows-Sysmon/Operational (Join-Path $artifactDir "sysmon.evtx")
+        Write-RunnerLog "exported sysmon.evtx"
+    } catch {
+        Write-RunnerLog ("sysmon export failed: {0}" -f $_.Exception.Message)
+    }
+
+    try {
+        wevtutil epl Microsoft-Windows-PowerShell/Operational (Join-Path $artifactDir "powershell_operational.evtx")
+        Write-RunnerLog "exported powershell_operational.evtx"
+    } catch {
+        Write-RunnerLog ("powershell operational export failed: {0}" -f $_.Exception.Message)
+    }
 
     $windowStart = $start.AddSeconds(-10)
     $windowEnd = $end.AddSeconds(10)

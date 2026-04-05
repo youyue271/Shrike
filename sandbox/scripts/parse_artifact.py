@@ -68,6 +68,31 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def load_ndjson(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    text = path.read_text(encoding="utf-8-sig").strip()
+    if not text:
+        return []
+
+    if text.startswith("["):
+        data = json.loads(text)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
 def load_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
@@ -659,6 +684,12 @@ def summarize_trace_artifacts(
         if isinstance(artifact_name, str) and (artifact_dir / artifact_name).exists() and artifact_name not in collected_artifacts:
             collected_artifacts.append(artifact_name)
 
+    if trace_mode == "dynamic_cfg":
+        dynamic_cfg_summary = summarize_dynamic_cfg_trace(
+            dynamic_cfg_summary,
+            load_ndjson(artifact_dir / "dynamic_cfg_trace.ndjson"),
+        )
+
     return {
         "mode": trace_mode,
         "backend": trace_backend,
@@ -668,6 +699,148 @@ def summarize_trace_artifacts(
         "collected_artifacts": collected_artifacts,
         "dynamic_cfg": dynamic_cfg_summary,
     }
+
+
+def summarize_dynamic_cfg_trace(
+    summary: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not summary and not events:
+        return {}
+
+    merged = dict(summary)
+    if not events:
+        return merged
+
+    modules_by_name: dict[str, dict[str, Any]] = {}
+    basic_blocks: set[tuple[str, str, str]] = set()
+    edges: set[tuple[str, str, str]] = set()
+    ordered_threads: dict[int, list[dict[str, Any]]] = {}
+    notes: list[str] = []
+
+    def ensure_module_entry(module_name: str, path: Any = None) -> dict[str, Any]:
+        entry = modules_by_name.setdefault(
+            module_name or "unknown",
+            {
+                "module": module_name or "unknown",
+                "path": path,
+                "base": None,
+                "size": None,
+                "_basic_blocks": set(),
+                "_edges": set(),
+            },
+        )
+        if not entry.get("path") and path:
+            entry["path"] = path
+        return entry
+
+    for event in events:
+        event_type = str(event.get("event", "") or "")
+        module_name = str(event.get("module", "") or "")
+
+        if event_type == "module_load" and module_name:
+            module_entry = ensure_module_entry(module_name, event.get("path"))
+            if not module_entry.get("path") and event.get("path"):
+                module_entry["path"] = event.get("path")
+            if not module_entry.get("base") and event.get("base"):
+                module_entry["base"] = event.get("base")
+            if not module_entry.get("size") and event.get("size") is not None:
+                module_entry["size"] = event.get("size")
+        elif event_type == "basic_block":
+            start = str(event.get("start", "") or "")
+            end = str(event.get("end", "") or "")
+            if start and end:
+                block_key = (module_name, start, end)
+                basic_blocks.add(block_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_basic_blocks"].add(block_key)
+        elif event_type == "edge":
+            source = str(event.get("source", "") or "")
+            target = str(event.get("target", "") or "")
+            if source and target:
+                edge_key = (module_name, source, target)
+                edges.add(edge_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_edges"].add(edge_key)
+        elif event_type == "sampled_block_execution":
+            start = str(event.get("block_start", "") or "")
+            end = str(event.get("block_end", "") or "")
+            if start and end:
+                block_key = (module_name, start, end)
+                basic_blocks.add(block_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_basic_blocks"].add(block_key)
+
+            thread_id = to_int(event.get("thread_id"))
+            if thread_id is not None:
+                ordered_threads.setdefault(thread_id, []).append(
+                    {
+                        "thread_id": thread_id,
+                        "sequence": to_int(event.get("sequence")),
+                        "round": to_int(event.get("round")),
+                        "module": module_name or "unknown",
+                        "path": event.get("path"),
+                        "block_start": start,
+                        "block_end": end,
+                        "instruction_pointer": event.get("instruction_pointer"),
+                        "architecture": event.get("architecture"),
+                    }
+                )
+        elif event_type == "trace_status":
+            message = str(event.get("message", "") or "").strip()
+            if message:
+                notes.append(message)
+            if event.get("status") and not merged.get("status"):
+                merged["status"] = event.get("status")
+
+    existing_notes = list(merged.get("notes", []) or [])
+    for note in notes:
+        if note not in existing_notes:
+            existing_notes.append(note)
+
+    merged["event_count"] = len(events)
+    merged["basic_block_count"] = len(basic_blocks)
+    merged["edge_count"] = len(edges)
+    merged["module_count"] = len(modules_by_name)
+    normalized_ordered_threads = []
+    total_ordered_samples = 0
+    for thread_id in sorted(ordered_threads):
+        samples = sorted(
+            ordered_threads[thread_id],
+            key=lambda item: (
+                item.get("sequence") if item.get("sequence") is not None else 10**9,
+                item.get("round") if item.get("round") is not None else 10**9,
+                str(item.get("block_start", "") or ""),
+            ),
+        )
+        total_ordered_samples += len(samples)
+        normalized_ordered_threads.append(
+            {
+                "thread_id": thread_id,
+                "sample_count": len(samples),
+                "samples": samples,
+            }
+        )
+    normalized_modules = []
+    for module_entry in modules_by_name.values():
+        normalized_modules.append(
+            {
+                "module": module_entry.get("module"),
+                "path": module_entry.get("path"),
+                "base": module_entry.get("base"),
+                "size": module_entry.get("size"),
+                "basic_block_count": len(module_entry.get("_basic_blocks", set())),
+                "edge_count": len(module_entry.get("_edges", set())),
+            }
+        )
+    merged["modules"] = sorted(normalized_modules, key=lambda item: str(item.get("module", "")))
+    merged["ordered_block_sample_count"] = total_ordered_samples
+    merged["ordered_thread_count"] = len(normalized_ordered_threads)
+    merged["ordered_threads"] = normalized_ordered_threads
+    if existing_notes:
+        merged["notes"] = existing_notes
+
+    return merged
 
 
 def flatten_registry_values(entries: list[dict[str, Any]] | None) -> dict[str, str]:
@@ -876,10 +1049,34 @@ def build_markdown_report(summary: dict[str, Any]) -> str:
             lines.append(f"- Note: `{trace.get('reason')}`")
         dynamic_cfg = trace.get("dynamic_cfg", {}) or {}
         if dynamic_cfg:
+            if "event_count" in dynamic_cfg:
+                lines.append(f"- Trace events: `{dynamic_cfg.get('event_count', 0)}`")
             lines.append(
                 f"- Dynamic CFG stats: basic_blocks=`{dynamic_cfg.get('basic_block_count', 0)}` "
                 f"edges=`{dynamic_cfg.get('edge_count', 0)}` modules=`{dynamic_cfg.get('module_count', 0)}`"
             )
+            if dynamic_cfg.get("ordered_block_sample_count", 0):
+                lines.append(
+                    f"- Ordered block samples: samples=`{dynamic_cfg.get('ordered_block_sample_count', 0)}` "
+                    f"threads=`{dynamic_cfg.get('ordered_thread_count', 0)}`"
+                )
+        lines.append("")
+    ordered_threads = (((trace or {}).get("dynamic_cfg", {}) or {}).get("ordered_threads", []) if trace else [])
+    if ordered_threads:
+        lines.append("## Sampled Block Order")
+        lines.append("")
+        for thread_entry in ordered_threads[:8]:
+            thread_id = thread_entry.get("thread_id", "unknown")
+            samples = thread_entry.get("samples", [])[:12]
+            if samples:
+                sequence = " -> ".join(
+                    f"{sample.get('module', 'unknown')}:{sample.get('block_start', '?')}"
+                    for sample in samples
+                )
+                lines.append(f"- thread=`{thread_id}` samples=`{thread_entry.get('sample_count', len(thread_entry.get('samples', [])))}`")
+                lines.append(f"  sequence=`{sequence}`")
+            else:
+                lines.append(f"- thread=`{thread_id}` samples=`0`")
         lines.append("")
     lines.append("## Analysis Quality")
     lines.append("")
