@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
+
+from task_profile import recommended_timeout_seconds
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout-seconds",
         type=int,
-        default=300,
-        help="Maximum task runtime before forced shutdown.",
+        default=None,
+        help="Maximum task runtime before forced shutdown. Defaults to an automatic profile-based budget when omitted.",
     )
     parser.add_argument(
         "--artifact-disk",
@@ -107,11 +110,23 @@ def main() -> int:
         print(f"ERROR: task profile not found: {task_profile}", file=sys.stderr)
         return 1
 
+    task_profile_data = None
+    if task_profile:
+        task_profile_data = json.loads(task_profile.read_text(encoding="utf-8-sig"))
+
     build_iso_script = root / "sandbox" / "scripts" / "build_sample_iso.py"
     ps_dir = root / "windows_host" / "powershell"
     new_artifact_ps = ps_dir / "03_new_artifact_disk.ps1"
     invoke_task_ps = ps_dir / "04_invoke_offline_task.ps1"
     mount_artifact_ps = ps_dir / "05_mount_artifact_disk.ps1"
+    recommended_timeout = (
+        recommended_timeout_seconds(task_profile_data) if task_profile_data is not None else None
+    )
+    effective_timeout_seconds = args.timeout_seconds if args.timeout_seconds is not None else recommended_timeout_seconds(task_profile_data)
+    if args.timeout_seconds is None:
+        print(f"Auto-selected timeout_seconds={effective_timeout_seconds} from task profile budget.")
+    if recommended_timeout is not None and args.timeout_seconds is not None and args.timeout_seconds < recommended_timeout:
+        print(f"WARNING: requested timeout_seconds={args.timeout_seconds} is below the recommended profile budget {recommended_timeout}.")
 
     run(
         [
@@ -149,7 +164,7 @@ def main() -> int:
         "-ArtifactDiskPath",
         wsl_to_windows(artifact_disk),
         "-TimeoutSeconds",
-        str(args.timeout_seconds),
+        str(effective_timeout_seconds),
     )
 
     powershell_script(

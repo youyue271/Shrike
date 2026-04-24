@@ -14,6 +14,48 @@ $ErrorActionPreference = "Stop"
 $request = Get-Content -Path $RequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $message = "Seed collector executed; this is not yet a full dynamic basic-block trace."
 
+function Get-BackendOptionValue {
+    param(
+        $Options,
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        $Default
+    )
+
+    if ($null -eq $Options) {
+        return $Default
+    }
+
+    $value = $null
+    if ($Options -is [System.Collections.IDictionary]) {
+        if (-not $Options.Contains($Name)) {
+            return $Default
+        }
+        $value = $Options[$Name]
+    } else {
+        $prop = $Options.PSObject.Properties[$Name]
+        if ($null -eq $prop) {
+            return $Default
+        }
+        $value = $prop.Value
+    }
+
+    if ($null -eq $value) {
+        return $Default
+    }
+
+    if ($Default -is [int]) {
+        try {
+            return [int]$value
+        } catch {
+            return [int]$Default
+        }
+    }
+
+    return $value
+}
+
 function Get-PeImageInfo {
     param(
         [Parameter(Mandatory = $true)]
@@ -521,6 +563,104 @@ function Resolve-InstructionModuleRecord {
     return $null
 }
 
+function Convert-RequestTimestampToUtc {
+    param([string]$Timestamp)
+
+    if (-not $Timestamp) {
+        return (Get-Date).ToUniversalTime()
+    }
+
+    try {
+        return ([datetimeoffset]::Parse($Timestamp)).UtcDateTime
+    } catch {
+        return (Get-Date).ToUniversalTime()
+    }
+}
+
+function Get-TraceWindowSamplePlan {
+    param($Request)
+
+    $sampleRounds = Get-BackendOptionValue -Options $Request.backend_options -Name "sample_rounds" -Default 24
+    $minimumSleepMilliseconds = Get-BackendOptionValue -Options $Request.backend_options -Name "sample_sleep_milliseconds" -Default 5
+    if ($sampleRounds -lt 1) {
+        $sampleRounds = 24
+    }
+    if ($minimumSleepMilliseconds -lt 0) {
+        $minimumSleepMilliseconds = 5
+    }
+
+    $deadlineUtc = Convert-RequestTimestampToUtc -Timestamp $Request.ended_at
+    $nowUtc = (Get-Date).ToUniversalTime()
+    $remainingMilliseconds = [Math]::Max(0, [int][Math]::Ceiling(($deadlineUtc - $nowUtc).TotalMilliseconds))
+
+    $sleepMilliseconds = 0
+    if ($sampleRounds -gt 1 -and $remainingMilliseconds -gt 0) {
+        $calculatedSleepMilliseconds = [Math]::Floor($remainingMilliseconds / [Math]::Max(1, ($sampleRounds - 1)))
+        $sleepMilliseconds = [int][Math]::Max($minimumSleepMilliseconds, [int]$calculatedSleepMilliseconds)
+    }
+
+    return [PSCustomObject]@{
+        SampleRounds = $sampleRounds
+        SleepMilliseconds = $sleepMilliseconds
+        DeadlineUtc = $deadlineUtc
+    }
+}
+
+function Collect-ThreadSamplesForTraceWindow {
+    param(
+        [int]$LaunchedPid,
+        $SamplePlan
+    )
+
+    $process = Try-GetProcessByIdSafe -TargetProcessId $LaunchedPid
+    if (-not $process) {
+        return @()
+    }
+
+    $threadSamples = [Shrike.Runtime.ThreadInstructionSampler]::CollectMultiple([int]$LaunchedPid, [int]$SamplePlan.SampleRounds, [int]$SamplePlan.SleepMilliseconds)
+    return @($threadSamples)
+}
+
+function Get-SampledBlockTransitions {
+    param([array]$OrderedBlockSamples)
+
+    $transitionMap = @{}
+    $sortedSamples = @($OrderedBlockSamples | Sort-Object thread_id, sequence)
+
+    foreach ($threadGroup in @($sortedSamples | Group-Object thread_id)) {
+        $threadSamples = @($threadGroup.Group | Sort-Object sequence)
+        for ($index = 1; $index -lt $threadSamples.Count; $index++) {
+            $previousSample = $threadSamples[$index - 1]
+            $currentSample = $threadSamples[$index]
+
+            if ($previousSample.module -ne $currentSample.module) {
+                continue
+            }
+            if (($previousSample.path -or "") -ne ($currentSample.path -or "")) {
+                continue
+            }
+            if ($previousSample.block_start -eq $currentSample.block_start) {
+                continue
+            }
+
+            $transitionKey = "{0}|{1}|{2}|{3}" -f $previousSample.module, ($previousSample.path -or ""), $previousSample.block_start, $currentSample.block_start
+            if (-not $transitionMap.ContainsKey($transitionKey)) {
+                $transitionMap[$transitionKey] = [PSCustomObject]@{
+                    Module = $previousSample.module
+                    Path = $previousSample.path
+                    Source = $previousSample.block_start
+                    Target = $currentSample.block_start
+                    Count = 0
+                }
+            }
+
+            $transitionMap[$transitionKey].Count += 1
+        }
+    }
+
+    return @($transitionMap.Values | Sort-Object Module, Source, Target)
+}
+
 $events = @(
     [ordered]@{
         event = "trace_status"
@@ -546,8 +686,28 @@ $moduleRecords = @()
 $process = $null
 $threadSamples = @()
 $orderedBlockSamples = @()
+$samplePlan = Get-TraceWindowSamplePlan -Request $request
 if ($request.launched_pid) {
     $process = Try-GetProcessByIdSafe -TargetProcessId ([int]$request.launched_pid)
+}
+
+if ($process) {
+    try {
+        Ensure-ThreadInstructionSamplerType
+        $threadSamples = Collect-ThreadSamplesForTraceWindow -LaunchedPid ([int]$request.launched_pid) -SamplePlan $samplePlan
+    } catch {
+        $events += [ordered]@{
+            event = "trace_status"
+            trace_mode = $request.trace_mode
+            trace_backend = $request.trace_backend
+            status = "seed_partial"
+            message = ("Thread context sampling failed: {0}" -f $_.Exception.Message)
+            sample_name = $request.sample_name
+            launched_pid = $request.launched_pid
+            started_at = $request.started_at
+            ended_at = $request.ended_at
+        }
+    }
 }
 
 if ($process) {
@@ -578,25 +738,6 @@ if ($process) {
             trace_backend = $request.trace_backend
             status = "seed_partial"
             message = ("Module enumeration failed: {0}" -f $_.Exception.Message)
-            sample_name = $request.sample_name
-            launched_pid = $request.launched_pid
-            started_at = $request.started_at
-            ended_at = $request.ended_at
-        }
-    }
-}
-
-if ($process) {
-    try {
-        Ensure-ThreadInstructionSamplerType
-        $threadSamples = [Shrike.Runtime.ThreadInstructionSampler]::CollectMultiple([int]$request.launched_pid, 12, 40)
-    } catch {
-        $events += [ordered]@{
-            event = "trace_status"
-            trace_mode = $request.trace_mode
-            trace_backend = $request.trace_backend
-            status = "seed_partial"
-            message = ("Thread context sampling failed: {0}" -f $_.Exception.Message)
             sample_name = $request.sample_name
             launched_pid = $request.launched_pid
             started_at = $request.started_at
@@ -646,6 +787,20 @@ foreach ($threadSample in $threadSamples) {
     }
     $events += $orderedBlockSample
     $orderedBlockSamples += [PSCustomObject]$orderedBlockSample
+}
+
+$sampledTransitions = Get-SampledBlockTransitions -OrderedBlockSamples $orderedBlockSamples
+foreach ($transition in $sampledTransitions) {
+    $events += [ordered]@{
+        event = "edge"
+        module = $transition.Module
+        path = $transition.Path
+        source = $transition.Source
+        target = $transition.Target
+        count = $transition.Count
+        kind = "sampled_transition"
+        pid = $request.launched_pid
+    }
 }
 
 $fallbackSamplePath = if ($request.sample_path) { [string]$request.sample_path } else { $null }
@@ -743,7 +898,7 @@ $summary = [ordered]@{
     ended_at = $request.ended_at
     event_count = $events.Count
     basic_block_count = $uniqueBlocks.Count
-    edge_count = 0
+    edge_count = $sampledTransitions.Count
     module_count = $uniqueModules.Count
     ordered_block_sample_count = $orderedBlockSamples.Count
     ordered_thread_count = @($orderedBlockSamples | Group-Object thread_id).Count

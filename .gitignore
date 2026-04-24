@@ -25,3 +25,4 @@ reports/*
 tmp/*
 !tmp/.gitkeep
 !tmp/README.md
+windows_host/third_party/*.zip

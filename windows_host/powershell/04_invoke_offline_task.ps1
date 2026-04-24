@@ -46,26 +46,63 @@ try {
     Write-Log -Message ("Restoring snapshot {0} on VM {1}" -f $SnapshotName, $VmName) -LogPath $logPath
     Restore-VMSnapshot -VMName $VmName -Name $SnapshotName -Confirm:$false
 
+    # Wait for snapshot restore to complete
+    Start-Sleep -Seconds 5
+
     Remove-OfflineArtifactDisk -VmName $VmName -ArtifactDiskPath $ArtifactDiskPath -LogPath $logPath
 
     $systemDisk = Get-PrimarySystemDisk -VmName $VmName -ArtifactDiskPath $ArtifactDiskPath -LogPath $logPath
 
-    $dvd = Get-VMDvdDrive -VMName $VmName -ErrorAction SilentlyContinue
-    if (-not $dvd) {
-        Add-VMDvdDrive -VMName $VmName -Path $SampleIsoPath | Out-Null
-        Write-Log -Message ("Attached sample ISO to new DVD device: {0}" -f $SampleIsoPath) -LogPath $logPath
+    # Set ISO on ALL DVD drives to ensure it's accessible
+    $dvdDrives = @(Get-VMDvdDrive -VMName $VmName -ErrorAction SilentlyContinue)
+    if ($dvdDrives.Count -eq 0) {
+        Add-VMDvdDrive -VMName $VmName -Path $SampleIsoPath -ErrorAction Stop | Out-Null
+        Write-Log -Message ("Added sample ISO to new DVD device: {0}" -f $SampleIsoPath) -LogPath $logPath
     } else {
-        Set-VMDvdDrive -VMName $VmName -Path $SampleIsoPath | Out-Null
-        Write-Log -Message ("Updated sample ISO on DVD device: {0}" -f $SampleIsoPath) -LogPath $logPath
+        foreach ($dvd in $dvdDrives) {
+            $dvd | Set-VMDvdDrive -Path $SampleIsoPath -ErrorAction Stop
+        }
+        Write-Log -Message ("Updated {0} DVD device(s) with sample ISO: {1}" -f $dvdDrives.Count, $SampleIsoPath) -LogPath $logPath
     }
 
-    Add-VMHardDiskDrive -VMName $VmName -Path $ArtifactDiskPath
+    # Verify at least one DVD drive has ISO attached
+    $dvdVerify = Get-VMDvdDrive -VMName $VmName | Where-Object { $_.Path -eq $SampleIsoPath }
+    if (-not $dvdVerify) {
+        throw "Failed to attach sample ISO to DVD drive"
+    }
+
+    # Add artifact disk - let Hyper-V choose the controller location automatically
+    Add-VMHardDiskDrive -VMName $VmName -Path $ArtifactDiskPath -ErrorAction Stop | Out-Null
     Write-Log -Message ("Attached artifact disk: {0}" -f $ArtifactDiskPath) -LogPath $logPath
+
+    # Verify artifact disk is attached
+    $artifactVerify = Get-VMHardDiskDrive -VMName $VmName | Where-Object { $_.Path -eq $ArtifactDiskPath }
+    if (-not $artifactVerify) {
+        throw "Failed to attach artifact disk"
+    }
 
     Set-OfflineTaskBootOrder -VmName $VmName -SystemDisk $systemDisk -LogPath $logPath
 
     Start-VM -Name $VmName | Out-Null
     Write-Log -Message ("Started VM {0}" -f $VmName) -LogPath $logPath
+
+    # Wait for VM to boot and then refresh CD-ROM drives to force media detection
+    Start-Sleep -Seconds 15
+    try {
+        $guestCred = New-Object System.Management.Automation.PSCredential("root", (ConvertTo-SecureString "root" -AsPlainText -Force))
+        Invoke-Command -VMName $VmName -Credential $guestCred -ScriptBlock {
+            # Force CD-ROM refresh
+            $drives = Get-WmiObject Win32_CDROMDrive
+            foreach ($drive in $drives) {
+                try {
+                    $drive.Drive | Out-Null
+                } catch {}
+            }
+        } -ErrorAction SilentlyContinue
+        Write-Log -Message "Refreshed CD-ROM drives in guest" -LogPath $logPath
+    } catch {
+        Write-Log -Message ("CD-ROM refresh failed: {0}" -f $_.Exception.Message) -LogPath $logPath -Level "WARN"
+    }
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {

@@ -5,13 +5,55 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from parse_artifact import summarize_trace_artifacts
-from task_profile import expected_trace_artifacts, validate_task_profile_dict
+from parse_artifact import build_summary, load_json, should_materialize_sysmon_from_evtx, summarize_trace_artifacts
+from task_profile import expected_trace_artifacts, recommended_timeout_seconds, validate_task_profile_dict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def write_minimal_drcov_log(path: Path, pid: int, block_offsets: list[int]) -> None:
+    lines = [
+        "DRCOV VERSION: 3",
+        "DRCOV FLAVOR: drcov",
+        "Module Table: version 5, count 2",
+        "Columns: id, containing_id, start, end, entry, offset, preferred_base, checksum, timestamp, path",
+        "  0,   0, 0x0000000140000000, 0x0000000140004000, 0x0000000140001000, 0000000000000000, 0x0000000140000000, 0x00000000, 0x00000000,  C:\\Sandbox\\input\\sample.exe",
+        "  1,   1, 0x00007FFB811B0000, 0x00007FFB813A8000, 0x00007FFB811B0000, 0000000000000000, 0x00007FFB811B0000, 0x00000000, 0x00000000,  C:\\Windows\\System32\\ntdll.dll",
+        f"BB Table: {len(block_offsets)} bbs",
+        "module id, start, size:",
+    ]
+    for offset in block_offsets:
+        lines.append(f"module[  0]: 0x{offset:016X},  16")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 class TraceArtifactSummaryTests(unittest.TestCase):
+    def test_load_json_treats_nul_padded_empty_artifact_as_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nul_only.json"
+            path.write_bytes(b"\x00" * 128)
+
+            self.assertIsNone(load_json(path))
+
+    def test_should_materialize_sysmon_when_summary_has_events_but_category_files_are_broken(self) -> None:
+        with TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp)
+            (artifact_dir / "sysmon.evtx").write_bytes(b"placeholder")
+            (artifact_dir / "sysmon_summary.json").write_text(
+                json.dumps(
+                    [
+                        {"EventId": 1, "Count": 5},
+                        {"EventId": 11, "Count": 7},
+                        {"EventId": 12, "Count": 3},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (artifact_dir / "sysmon_process_events.json").write_text("[]", encoding="utf-8")
+            (artifact_dir / "sysmon_file_events.json").write_bytes(b"\x00" * 64)
+
+            self.assertTrue(should_materialize_sysmon_from_evtx(artifact_dir))
+
     def test_summarize_trace_artifacts_infers_collected_files_from_disk(self) -> None:
         with TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp)
@@ -255,12 +297,102 @@ class TraceArtifactSummaryTests(unittest.TestCase):
 
             self.assertEqual(summary["dynamic_cfg"]["ordered_block_sample_count"], 3)
             self.assertEqual(summary["dynamic_cfg"]["ordered_thread_count"], 2)
+            self.assertEqual(summary["dynamic_cfg"]["edge_count"], 1)
             self.assertEqual(summary["dynamic_cfg"]["ordered_threads"][0]["thread_id"], 101)
             self.assertEqual(
                 [sample["block_start"] for sample in summary["dynamic_cfg"]["ordered_threads"][0]["samples"]],
                 ["0x140001000", "0x140001020"],
             )
             self.assertEqual(summary["dynamic_cfg"]["ordered_threads"][1]["thread_id"], 202)
+            self.assertEqual(summary["dynamic_cfg"]["modules"][0]["edge_count"], 1)
+
+    def test_summarize_trace_artifacts_recovers_drio_trace_from_raw_logs_without_manifest(self) -> None:
+        with TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp)
+            drio_dir = artifact_dir / "drio"
+            drio_dir.mkdir()
+
+            (artifact_dir / "trace_request.json").write_text(
+                json.dumps(
+                    {
+                        "trace_mode": "dynamic_cfg",
+                        "trace_backend": "drio",
+                        "sample_name": "sample.exe",
+                        "launched_pid": 4000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_minimal_drcov_log(drio_dir / "drcov.sample.exe.04096.0000.proc.log", 4096, [0x1000, 0x1010])
+            write_minimal_drcov_log(drio_dir / "drcov.sample.exe.04112.0000.proc.log", 4112, [0x1000])
+
+            summary = summarize_trace_artifacts(
+                {"trace_mode": "dynamic_cfg", "trace_backend": "drio"},
+                {"trace_mode": "dynamic_cfg", "trace_backend": "drio"},
+                artifact_dir,
+            )
+
+            self.assertEqual(summary["status"], "drcov_basic_blocks")
+            self.assertEqual(summary["backend"], "drio")
+            self.assertEqual(summary["dynamic_cfg"]["drio_mode"], "drcov_text_first_seen_order")
+            self.assertEqual(summary["dynamic_cfg"]["basic_block_count"], 2)
+            self.assertEqual(summary["dynamic_cfg"]["edge_count"], 1)
+            self.assertEqual(summary["dynamic_cfg"]["ordered_block_sample_count"], 3)
+            self.assertEqual(summary["dynamic_cfg"]["ordered_thread_count"], 2)
+            self.assertEqual(summary["dynamic_cfg"]["process_ids"], [4096, 4112])
+            self.assertEqual(summary["dynamic_cfg"]["ordered_threads"][0]["thread_id"], 4096)
+            self.assertEqual(
+                [sample["block_start"] for sample in summary["dynamic_cfg"]["ordered_threads"][0]["samples"]],
+                ["0x140001000", "0x140001010"],
+            )
+
+    def test_build_summary_uses_recovered_drio_process_ids_as_related_pids(self) -> None:
+        with TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp)
+            drio_dir = artifact_dir / "drio"
+            drio_dir.mkdir()
+
+            (artifact_dir / "sample_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "sample_name": "sample.exe",
+                        "sample_path": r"C:\\Sandbox\\input\\sample.exe",
+                        "launched_pid": 4000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (artifact_dir / "task_profile.json").write_text(
+                json.dumps({"profile_name": "deep_cfg_drio", "trace_mode": "dynamic_cfg", "trace_backend": "drio"}),
+                encoding="utf-8",
+            )
+            (artifact_dir / "task_runtime_context.json").write_text(
+                json.dumps({"trace_mode": "dynamic_cfg", "trace_backend": "drio"}),
+                encoding="utf-8",
+            )
+            (artifact_dir / "trace_request.json").write_text(
+                json.dumps(
+                    {
+                        "trace_mode": "dynamic_cfg",
+                        "trace_backend": "drio",
+                        "sample_name": "sample.exe",
+                        "launched_pid": 4000,
+                        "started_at": "2026-04-06T15:04:27.8045552-07:00",
+                        "ended_at": "2026-04-06T15:07:27.8045552-07:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_minimal_drcov_log(drio_dir / "drcov.sample.exe.04096.0000.proc.log", 4096, [0x1000, 0x1010])
+            write_minimal_drcov_log(drio_dir / "drcov.sample.exe.04112.0000.proc.log", 4112, [0x1000])
+
+            summary = build_summary(
+                artifact_dir,
+                sorted(path.name for path in artifact_dir.iterdir() if path.is_file()),
+            )
+
+            self.assertEqual(summary["trace"]["status"], "drcov_basic_blocks")
+            self.assertEqual(summary["related_pids"], [4000, 4096, 4112])
 
 
 class TaskProfileValidationTests(unittest.TestCase):
@@ -293,16 +425,54 @@ class TaskProfileValidationTests(unittest.TestCase):
             }
         )
 
+    def test_validate_task_profile_accepts_drio_backend_shape(self) -> None:
+        validate_task_profile_dict(
+            {
+                "profile_name": "deep_cfg_drio",
+                "trace_mode": "dynamic_cfg",
+                "trace_backend": "drio",
+                "capture": {
+                    "cfg": True,
+                    "dfg": False,
+                    "memory_writes": True,
+                    "register_snapshots": False,
+                },
+                "backend_options": {
+                    "sample_rounds": 24,
+                    "sample_sleep_milliseconds": 5,
+                },
+            }
+        )
+
+    def test_recommended_timeout_seconds_accounts_for_drio_export_slack(self) -> None:
+        timeout_seconds = recommended_timeout_seconds(
+            {
+                "profile_name": "deep_cfg_drio",
+                "trace_mode": "dynamic_cfg",
+                "trace_backend": "drio",
+                "execution_window_seconds": 180,
+                "boot_stabilization_seconds": 30,
+            }
+        )
+
+        self.assertEqual(timeout_seconds, 510)
+
+    def test_recommended_timeout_seconds_falls_back_to_default_without_profile(self) -> None:
+        self.assertEqual(recommended_timeout_seconds(None), 300)
+
 
 class GuestRuntimeTraceTimingTests(unittest.TestCase):
-    def test_run_task_invokes_trace_collection_before_execution_window_sleep(self) -> None:
+    def test_run_task_buffers_non_deferred_trace_collection_around_execution_window_sleep(self) -> None:
         script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
-        export_call = "Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd"
+        capture_call = "Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd"
         sleep_call = "Start-Sleep -Seconds $executionWindowSeconds"
+        write_call = "Write-TraceArtifactBuffer -TraceArtifactBuffer $traceArtifactBuffer -ArtifactDir $artifactDir"
 
-        self.assertIn(export_call, script)
+        self.assertIn(capture_call, script)
         self.assertIn(sleep_call, script)
-        self.assertLess(script.index(export_call), script.index(sleep_call))
+        self.assertIn(write_call, script)
+        self.assertLess(script.index(capture_call), script.index(sleep_call))
+        self.assertLess(script.index(sleep_call), script.index(write_call))
 
     def test_run_task_propagates_sample_path_into_trace_request(self) -> None:
         script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
@@ -313,6 +483,105 @@ class GuestRuntimeTraceTimingTests(unittest.TestCase):
             "Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd",
             script,
         )
+
+    def test_run_task_dispatches_drio_backend_script(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Get-TraceBackendScriptPath {", script)
+        self.assertIn('"drio" { return "C:\\Sandbox\\runtime\\trace_backend_drio.ps1" }', script)
+        self.assertIn('$traceBackendScript = Get-TraceBackendScriptPath -TraceMode $traceMode -TraceBackend $traceBackend', script)
+
+    def test_run_task_launches_drio_sample_through_drrun_custom_client(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Get-DrioDrrunPath {", script)
+        self.assertIn("function Get-DrioClientRuntimePaths {", script)
+        self.assertIn('$drioLogDir = Join-Path $artifactDir "drio"', script)
+        self.assertIn('$proc = Start-Process -FilePath $drrunPath -ArgumentList @(', script)
+        self.assertIn('"-c32"', script)
+        self.assertIn('"-c64"', script)
+        self.assertIn('"C:\\Sandbox\\runtime\\drio\\bin32\\shrike_drcov_nudge.dll"', script)
+        self.assertIn('"C:\\Sandbox\\runtime\\drio\\bin64\\shrike_drcov_nudge.dll"', script)
+        self.assertIn('"-dump_text"', script)
+        self.assertIn('"-logdir"', script)
+        self.assertIn('"-logprefix"', script)
+        self.assertIn('launcher = if ($deferTraceExport) { "drrun_custom_drcov_client" } else { "direct" }', script)
+
+    def test_run_task_defers_drio_trace_export_until_after_sleep(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Should-DeferTraceExport {", script)
+        self.assertIn('$deferTraceExport = Should-DeferTraceExport -TaskProfile $taskProfile', script)
+        self.assertIn('if (-not $deferTraceExport) {', script)
+        self.assertIn('if ($deferTraceExport) {', script)
+
+    def test_run_task_waits_for_drio_process_exit_before_trace_export(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Stop-TraceLauncherProcessTree {", script)
+        self.assertIn("Stop-TraceLauncherProcessTree -LauncherProcessId $proc.Id", script)
+        self.assertLess(
+            script.index("Stop-TraceLauncherProcessTree -LauncherProcessId $proc.Id"),
+            script.index("Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd"),
+        )
+
+    def test_run_task_force_terminates_drio_process_tree_after_grace_period(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('"/T"', script)
+        self.assertIn('"/F"', script)
+
+    def test_run_task_attempts_graceful_drio_process_tree_shutdown_before_force_kill(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId", script)
+        self.assertIn("Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId -Force", script)
+        self.assertLess(
+            script.index("Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId"),
+            script.index("Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId -Force"),
+        )
+
+    def test_run_task_attempts_drio_nudge_before_taskkill_shutdown(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Invoke-DrioNudgeForTraceTargets {", script)
+        self.assertIn('"-nudge"', script)
+        self.assertIn("Invoke-DrioNudgeForTraceTargets -SampleName $SampleName -TreeIds $treeIds", script)
+        self.assertLess(
+            script.index("Invoke-DrioNudgeForTraceTargets -SampleName $SampleName -TreeIds $treeIds"),
+            script.index("Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId"),
+        )
+
+    def test_run_task_restores_missing_trace_backend_script_from_cached_content(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("$script:TraceBackendScriptContentCache = @{}", script)
+        self.assertIn("function Save-TraceBackendScriptContent {", script)
+        self.assertIn("function Restore-TraceBackendScriptIfMissing {", script)
+        self.assertIn("Save-TraceBackendScriptContent -TraceBackendScriptPath $traceBackendScriptPath", script)
+        self.assertIn("Restore-TraceBackendScriptIfMissing -TraceBackendScriptPath $traceBackendScript", script)
+
+    def test_run_task_sanitizes_invalid_sysmon_xml_chars_before_parsing(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Remove-InvalidXmlChars {", script)
+        self.assertIn("function Convert-EventRecordToSafeXml {", script)
+        self.assertIn("$xmlText = Remove-InvalidXmlChars -Text $Event.ToXml()", script)
+        self.assertIn("$xml = Convert-EventRecordToSafeXml -Event $Event", script)
+
+    def test_run_task_expands_drio_nudge_targets_for_extensionless_samples(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Get-DrioNudgeTargetNames {", script)
+        self.assertIn('[void]$targetNames.Add($SampleName)', script)
+        self.assertIn('[void]$targetNames.Add(("{0}.exe" -f $SampleName))', script)
+        self.assertIn("Stop-TraceLauncherProcessTree -LauncherProcessId $proc.Id -SampleName $sample.Name", script)
+
+    def test_run_task_suppresses_arraylist_indexes_when_building_drio_target_names(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('[void]$targetNames.Add($SampleName)', script)
+        self.assertIn('[void]$targetNames.Add(("{0}.exe" -f $SampleName))', script)
 
 
 class PlaceholderBackendFallbackTests(unittest.TestCase):
@@ -347,6 +616,174 @@ class PlaceholderBackendFallbackTests(unittest.TestCase):
         self.assertIn(sample_call, script)
         self.assertIn(module_enum_call, script)
         self.assertLess(script.index(sample_call), script.index(module_enum_call))
+
+
+class GuestRuntimeInstallTests(unittest.TestCase):
+    def test_install_guest_runtime_includes_drio_backend_and_custom_clients(self) -> None:
+        script = (REPO_ROOT / "windows_host" / "powershell" / "06_install_guest_runtime.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('[string]$TraceBackendDrioSourcePath = "guest\\runtime\\trace_backend_drio.ps1"', script)
+        self.assertIn('[string]$DrioClient32SourcePath = "windows_host\\drio_client\\bin32\\release\\shrike_drcov_nudge.dll"', script)
+        self.assertIn('[string]$DrioClient64SourcePath = "windows_host\\drio_client\\bin64\\release\\shrike_drcov_nudge.dll"', script)
+        self.assertIn('$DrioClient32SourcePath = Resolve-ProjectPath -Path $DrioClient32SourcePath -RepoRoot $repoRoot', script)
+        self.assertIn('$DrioClient64SourcePath = Resolve-ProjectPath -Path $DrioClient64SourcePath -RepoRoot $repoRoot', script)
+        self.assertIn('$TraceBackendDrioSourcePath = Resolve-ProjectPath -Path $TraceBackendDrioSourcePath -RepoRoot $repoRoot', script)
+        self.assertIn('$traceBackendDrioContent = Get-Content -Path $TraceBackendDrioSourcePath -Raw -Encoding UTF8', script)
+        self.assertIn('$drioClient32Base64 = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($DrioClient32SourcePath))', script)
+        self.assertIn('$drioClient64Base64 = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($DrioClient64SourcePath))', script)
+        self.assertIn('Set-Content -Path "C:\\Sandbox\\runtime\\trace_backend_drio.ps1" -Value $TraceBackendDrioContent -Encoding UTF8', script)
+        self.assertIn('[System.IO.File]::WriteAllBytes("C:\\Sandbox\\runtime\\drio\\bin32\\shrike_drcov_nudge.dll", [System.Convert]::FromBase64String($DrioClient32Base64))', script)
+        self.assertIn('[System.IO.File]::WriteAllBytes("C:\\Sandbox\\runtime\\drio\\bin64\\shrike_drcov_nudge.dll", [System.Convert]::FromBase64String($DrioClient64Base64))', script)
+
+
+class DrioBackendTests(unittest.TestCase):
+    def test_drio_backend_parses_drcov_text_logs(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "trace_backend_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Parse-DrcovTextLog {", script)
+        self.assertIn("function Convert-DrcovEntriesToEvents {", script)
+        self.assertIn('status = "drcov_basic_blocks"', script)
+        self.assertIn('kind = "drcov_text"', script)
+        self.assertIn('event = "basic_block"', script)
+        self.assertIn('$drcovLogDir = if ($request.drio_log_dir) {', script)
+
+    def test_drio_backend_uses_version5_module_table_columns_for_base_end_and_path(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "trace_backend_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("$parts = $line -split ',\\s*', 10", script)
+        self.assertIn("Convert-NumberStringToUInt64 $parts[2]", script)
+        self.assertIn("Convert-NumberStringToUInt64 $parts[3]", script)
+        self.assertIn("$parts[9].Trim()", script)
+
+    def test_drio_backend_trims_numeric_fields_before_uint64_conversion(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "trace_backend_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("$text = ([string]$Value).Trim()", script)
+
+    def test_drio_backend_summary_uses_explicit_keys_for_unique_modules_and_blocks(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "trace_backend_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("$moduleSeen = @{}", script)
+        self.assertIn("$basicBlockSeen = @{}", script)
+
+    def test_drio_backend_emits_process_scoped_ordered_block_samples(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "trace_backend_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('function Get-DrcovLogProcessId {', script)
+        self.assertIn('event = "sampled_block_execution"', script)
+        self.assertIn('thread_id = $logProcessId', script)
+        self.assertIn('kind = "drcov_first_seen_order"', script)
+
+    def test_drio_backend_emits_edges_from_adjacent_first_seen_blocks(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "trace_backend_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('event = "edge"', script)
+        self.assertIn('$previousOrderedBlock = $null', script)
+        self.assertIn('source = $previousOrderedBlock.start', script)
+        self.assertIn('target = $orderedBlockEvent.block_start', script)
+
+    def test_drio_backend_summary_counts_ordered_process_sequences_with_explicit_keys(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "trace_backend_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("$orderedThreadSeen = @{}", script)
+
+
+class DrioInstallScriptTests(unittest.TestCase):
+    def test_host_installer_copies_and_extracts_dynamorio_zip_into_guest(self) -> None:
+        script = (REPO_ROOT / "windows_host" / "powershell" / "10_install_drio.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('[Parameter(Mandatory = $true)]', script)
+        self.assertIn('[string]$DynamoRIOZipPath', script)
+        self.assertIn('[string]$GuestInstallRoot = "C:\\Tools\\DynamoRIO"', script)
+        self.assertIn('$session = New-PSSession -VMName $VmName -Credential $credential', script)
+        self.assertIn('Copy-Item -Path $DynamoRIOZipPath -Destination $guestPackagePath -ToSession $session -Force', script)
+        self.assertIn('if ($session) {', script)
+        self.assertIn('Remove-PSSession -Session $session', script)
+        self.assertIn('Expand-Archive -LiteralPath $PackagePath -DestinationPath $expandedRoot -Force', script)
+        self.assertIn('Join-Path $InstallRoot "bin64\\drrun.exe"', script)
+
+    def test_wsl_wrapper_invokes_host_drio_installer(self) -> None:
+        script = (REPO_ROOT / "sandbox" / "scripts" / "install_drio_runtime.py").read_text(encoding="utf-8")
+
+        self.assertIn('description="Install a DynamoRIO runtime package into the Hyper-V guest from WSL."', script)
+        self.assertIn('parser.add_argument("package_path", help="Path to the DynamoRIO Windows zip package.")', script)
+        self.assertIn('script = root / "windows_host" / "powershell" / "10_install_drio.ps1"', script)
+        self.assertIn('"-DynamoRIOZipPath"', script)
+
+
+class DrioClientBuildTests(unittest.TestCase):
+    def test_host_build_script_compiles_custom_drio_client_for_both_bitnesses(self) -> None:
+        script = (REPO_ROOT / "windows_host" / "powershell" / "11_build_drio_nudge_client.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('[string]$DynamoRIOZipPath = "windows_host\\third_party\\DynamoRIO-Windows.zip"', script)
+        self.assertIn('[string]$ClientSourcePath = "windows_host\\drio_client\\src\\shrike_drcov_nudge.c"', script)
+        self.assertIn("vcvarsall.bat", script)
+        self.assertIn("dynamorio.lib", script)
+        self.assertIn("drcovlib.lib", script)
+        self.assertIn("drmgr.lib", script)
+        self.assertIn("bin32\\release\\shrike_drcov_nudge.dll", script)
+        self.assertIn("bin64\\release\\shrike_drcov_nudge.dll", script)
+
+    def test_custom_drio_client_registers_nudge_callback_and_uses_drcovlib(self) -> None:
+        script = (REPO_ROOT / "windows_host" / "drio_client" / "src" / "shrike_drcov_nudge.c").read_text(encoding="utf-8")
+
+        self.assertIn('#include "dr_api.h"', script)
+        self.assertIn('#include "dr_events.h"', script)
+        self.assertIn('#include "drcovlib.h"', script)
+        self.assertIn("dr_register_nudge_event", script)
+        self.assertIn("drcovlib_init", script)
+        self.assertIn("drcovlib_dump", script)
+        self.assertIn("drcovlib_exit", script)
+
+    def test_custom_drio_client_has_execution_triggered_dump_fallback(self) -> None:
+        script = (REPO_ROOT / "windows_host" / "drio_client" / "src" / "shrike_drcov_nudge.c").read_text(encoding="utf-8")
+
+        self.assertIn('#include "drmgr.h"', script)
+        self.assertIn('#include "dr_ir_utils.h"', script)
+        self.assertIn("drmgr_init", script)
+        self.assertIn("drmgr_register_bb_instrumentation_event", script)
+        self.assertIn("dr_insert_clean_call", script)
+        self.assertIn("dr_atomic_add32_return_sum", script)
+
+
+class OfflineTaskTimeoutBudgetTests(unittest.TestCase):
+    def test_run_offline_task_derives_timeout_from_task_profile_when_unspecified(self) -> None:
+        script = (REPO_ROOT / "sandbox" / "scripts" / "run_offline_task.py").read_text(encoding="utf-8")
+
+        self.assertIn("recommended_timeout_seconds", script)
+        self.assertIn("args.timeout_seconds if args.timeout_seconds is not None else recommended_timeout_seconds(task_profile_data)", script)
+        self.assertIn('print(f"Auto-selected timeout_seconds={effective_timeout_seconds} from task profile budget.")', script)
+
+    def test_run_offline_task_warns_when_manual_timeout_is_below_recommended_budget(self) -> None:
+        script = (REPO_ROOT / "sandbox" / "scripts" / "run_offline_task.py").read_text(encoding="utf-8")
+
+        self.assertIn("if recommended_timeout is not None and args.timeout_seconds is not None and args.timeout_seconds < recommended_timeout:", script)
+        self.assertIn('print(f"WARNING: requested timeout_seconds={args.timeout_seconds} is below the recommended profile budget {recommended_timeout}.")', script)
+
+    def test_analyze_sample_only_forwards_timeout_when_explicitly_set(self) -> None:
+        script = (REPO_ROOT / "sandbox" / "scripts" / "analyze_sample.py").read_text(encoding="utf-8")
+
+        self.assertIn("if args.timeout_seconds is not None:", script)
+        self.assertIn('run_cmd.extend(["--timeout-seconds", str(args.timeout_seconds)])', script)
+
+
+class RawArtifactCopyTests(unittest.TestCase):
+    def test_copy_raw_artifacts_preserves_nested_drio_logs(self) -> None:
+        from parse_artifact import copy_raw_artifacts
+
+        with TemporaryDirectory() as src_tmp, TemporaryDirectory() as dst_tmp:
+            src_dir = Path(src_tmp)
+            dst_dir = Path(dst_tmp)
+            (src_dir / "top.json").write_text("{}", encoding="utf-8")
+            drio_dir = src_dir / "drio"
+            drio_dir.mkdir()
+            (drio_dir / "drcov.sample.0001.proc.log").write_text("DRCOV VERSION: 3\n", encoding="utf-8")
+
+            copied = copy_raw_artifacts(src_dir, dst_dir)
+
+            self.assertIn("top.json", copied)
+            self.assertIn("drio/drcov.sample.0001.proc.log", copied)
+            self.assertTrue((dst_dir / "drio" / "drcov.sample.0001.proc.log").exists())
 
 
 if __name__ == "__main__":

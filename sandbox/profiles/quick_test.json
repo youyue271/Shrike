@@ -1,19 +1,19 @@
 {
-  "profile_name": "deep_cfg_baseline",
+  "profile_name": "quick_test",
   "trace_mode": "dynamic_cfg",
   "trace_backend": "placeholder",
   "network_mode": "airgap",
   "user_simulation": "none",
-  "execution_window_seconds": 180,
+  "execution_window_seconds": 10,
   "boot_stabilization_seconds": 30,
   "backend_options": {
-    "sample_rounds": 24,
+    "sample_rounds": 5,
     "sample_sleep_milliseconds": 5
   },
   "capture": {
     "cfg": true,
     "dfg": false,
-    "memory_writes": true,
+    "memory_writes": false,
     "register_snapshots": false
   }
 }

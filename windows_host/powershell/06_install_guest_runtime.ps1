@@ -1,8 +1,13 @@
 param(
     [string]$VmName = "rw-sandbox-win10",
     [string]$GuestUser = "analyst",
+    [string]$GuestPassword = "analyst",
     [string]$RuntimeSourcePath = "guest\runtime\run_task.ps1",
+    [string]$ConfigureNetworkSourcePath = "guest\runtime\configure_network.ps1",
     [string]$TraceBackendPlaceholderSourcePath = "guest\runtime\trace_backend_placeholder.ps1",
+    [string]$TraceBackendDrioSourcePath = "guest\runtime\trace_backend_drio.ps1",
+    [string]$DrioClientBin32SourcePath = "guest\runtime\drio\bin32\shrike_drcov_nudge.dll",
+    [string]$DrioClientBin64SourcePath = "guest\runtime\drio\bin64\shrike_drcov_nudge.dll",
     [string]$SysmonConfigSourcePath = "guest\runtime\sysmon_config.xml",
     [string]$SysmonBinarySourcePath = "windows_host\sysmon\sysmon64.exe",
     [string]$TaskName = "SandboxRunTask"
@@ -13,7 +18,11 @@ param(
 $repoRoot = Resolve-RepoRoot
 $logPath = New-LogFilePath -ScriptName "06_install_guest_runtime" -RepoRoot $repoRoot
 $RuntimeSourcePath = Resolve-ProjectPath -Path $RuntimeSourcePath -RepoRoot $repoRoot
+$ConfigureNetworkSourcePath = Resolve-ProjectPath -Path $ConfigureNetworkSourcePath -RepoRoot $repoRoot
 $TraceBackendPlaceholderSourcePath = Resolve-ProjectPath -Path $TraceBackendPlaceholderSourcePath -RepoRoot $repoRoot
+$TraceBackendDrioSourcePath = Resolve-ProjectPath -Path $TraceBackendDrioSourcePath -RepoRoot $repoRoot
+$DrioClientBin32SourcePath = Resolve-ProjectPath -Path $DrioClientBin32SourcePath -RepoRoot $repoRoot
+$DrioClientBin64SourcePath = Resolve-ProjectPath -Path $DrioClientBin64SourcePath -RepoRoot $repoRoot
 $SysmonConfigSourcePath = Resolve-ProjectPath -Path $SysmonConfigSourcePath -RepoRoot $repoRoot
 $SysmonBinarySourcePath = Resolve-ProjectPath -Path $SysmonBinarySourcePath -RepoRoot $repoRoot
 
@@ -24,8 +33,14 @@ try {
     if (-not (Test-Path $RuntimeSourcePath)) {
         throw "Guest runtime source file not found: $RuntimeSourcePath"
     }
+    if (-not (Test-Path $ConfigureNetworkSourcePath)) {
+        throw "Configure network source file not found: $ConfigureNetworkSourcePath"
+    }
     if (-not (Test-Path $TraceBackendPlaceholderSourcePath)) {
         throw "Trace backend placeholder source file not found: $TraceBackendPlaceholderSourcePath"
+    }
+    if (-not (Test-Path $TraceBackendDrioSourcePath)) {
+        throw "Trace backend drio source file not found: $TraceBackendDrioSourcePath"
     }
     if (-not (Test-Path $SysmonConfigSourcePath)) {
         throw "Sysmon config source file not found: $SysmonConfigSourcePath"
@@ -37,8 +52,11 @@ try {
     }
 
     $scriptContent = Get-Content -Path $RuntimeSourcePath -Raw -Encoding UTF8
+    $configureNetworkContent = Get-Content -Path $ConfigureNetworkSourcePath -Raw -Encoding UTF8
     $traceBackendPlaceholderContent = Get-Content -Path $TraceBackendPlaceholderSourcePath -Raw -Encoding UTF8
+    $traceBackendDrioContent = Get-Content -Path $TraceBackendDrioSourcePath -Raw -Encoding UTF8
     $sysmonConfigContent = Get-Content -Path $SysmonConfigSourcePath -Raw -Encoding UTF8
+
     $sysmonBinaryBase64 = $null
     if (Test-Path $SysmonBinarySourcePath) {
         $sysmonBinaryBase64 = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($SysmonBinarySourcePath))
@@ -47,13 +65,20 @@ try {
         Write-Log -Message ("Sysmon binary source not found at {0}. Will only try to reconfigure an existing in-guest Sysmon install." -f $SysmonBinarySourcePath) -LogPath $logPath -Level "WARN"
     }
     Write-Log -Message ("Loaded guest runtime source: {0}" -f $RuntimeSourcePath) -LogPath $logPath
+    Write-Log -Message ("Loaded configure network source: {0}" -f $ConfigureNetworkSourcePath) -LogPath $logPath
     Write-Log -Message ("Loaded trace backend placeholder source: {0}" -f $TraceBackendPlaceholderSourcePath) -LogPath $logPath
+    Write-Log -Message ("Loaded trace backend drio source: {0}" -f $TraceBackendDrioSourcePath) -LogPath $logPath
     Write-Log -Message ("Loaded Sysmon config source: {0}" -f $SysmonConfigSourcePath) -LogPath $logPath
 
-    $credential = Get-Credential -UserName $GuestUser -Message "Enter guest credentials for PowerShell Direct"
+    $securePassword = ConvertTo-SecureString $GuestPassword -AsPlainText -Force
+    $credential = New-Object System.Management.Automation.PSCredential($GuestUser, $securePassword)
 
-    $result = Invoke-Command -VMName $VmName -Credential $credential -ScriptBlock {
-        param($Content, $TraceBackendPlaceholderContent, $SysmonConfigContent, $SysmonBinaryBase64, $ScheduledTaskName)
+    $session = $null
+    try {
+        $session = New-PSSession -VMName $VmName -Credential $credential
+
+        $result = Invoke-Command -Session $session -ScriptBlock {
+            param($Content, $ConfigureNetworkContent, $TraceBackendPlaceholderContent, $TraceBackendDrioContent, $SysmonConfigContent, $SysmonBinaryBase64, $ScheduledTaskName)
 
         function Invoke-NativeCommandSafe {
             param(
@@ -91,8 +116,13 @@ try {
         New-Item -ItemType Directory -Force "C:\Sandbox\sysmon" | Out-Null
 
         Set-Content -Path "C:\Sandbox\runtime\run_task.ps1" -Value $Content -Encoding UTF8
+        Set-Content -Path "C:\Sandbox\runtime\configure_network.ps1" -Value $ConfigureNetworkContent -Encoding UTF8
         Set-Content -Path "C:\Sandbox\runtime\trace_backend_placeholder.ps1" -Value $TraceBackendPlaceholderContent -Encoding UTF8
+        Set-Content -Path "C:\Sandbox\runtime\trace_backend_drio.ps1" -Value $TraceBackendDrioContent -Encoding UTF8
         Set-Content -Path "C:\Sandbox\runtime\sysmon_config.xml" -Value $SysmonConfigContent -Encoding UTF8
+
+        New-Item -ItemType Directory -Force "C:\Sandbox\runtime\drio\bin32" | Out-Null
+        New-Item -ItemType Directory -Force "C:\Sandbox\runtime\drio\bin64" | Out-Null
 
         $projectSysmonPath = "C:\Sandbox\sysmon\sysmon64.exe"
         $sysmonInstalledFromProject = $false
@@ -107,7 +137,17 @@ try {
             [ref]$null
         )
         $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            "C:\Sandbox\runtime\configure_network.ps1",
+            [ref]$null,
+            [ref]$null
+        )
+        $null = [System.Management.Automation.Language.Parser]::ParseFile(
             "C:\Sandbox\runtime\trace_backend_placeholder.ps1",
+            [ref]$null,
+            [ref]$null
+        )
+        $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            "C:\Sandbox\runtime\trace_backend_drio.ps1",
             [ref]$null,
             [ref]$null
         )
@@ -198,7 +238,9 @@ try {
 
         [PSCustomObject]@{
             RuntimePath = "C:\Sandbox\runtime\run_task.ps1"
+            ConfigureNetworkPath = "C:\Sandbox\runtime\configure_network.ps1"
             TraceBackendPlaceholderPath = "C:\Sandbox\runtime\trace_backend_placeholder.ps1"
+            TraceBackendDrioPath = "C:\Sandbox\runtime\trace_backend_drio.ps1"
             SysmonConfigPath = "C:\Sandbox\runtime\sysmon_config.xml"
             TaskName = $ScheduledTaskName
             RuntimeSize = (Get-Item "C:\Sandbox\runtime\run_task.ps1").Length
@@ -214,10 +256,27 @@ try {
             SysmonCommandStdErr = $sysmonCommandStdErr
             SysmonMessage = $sysmonMessage
         }
-    } -ArgumentList $scriptContent, $traceBackendPlaceholderContent, $sysmonConfigContent, $sysmonBinaryBase64, $TaskName
+    } -ArgumentList $scriptContent, $configureNetworkContent, $traceBackendPlaceholderContent, $traceBackendDrioContent, $sysmonConfigContent, $sysmonBinaryBase64, $TaskName
+
+    if (Test-Path $DrioClientBin32SourcePath) {
+        Copy-Item -Path $DrioClientBin32SourcePath -Destination "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll" -ToSession $session -Force
+        Write-Log -Message ("Deployed DRIO client 32-bit DLL via Copy-Item -ToSession") -LogPath $logPath
+    }
+    if (Test-Path $DrioClientBin64SourcePath) {
+        Copy-Item -Path $DrioClientBin64SourcePath -Destination "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll" -ToSession $session -Force
+        Write-Log -Message ("Deployed DRIO client 64-bit DLL via Copy-Item -ToSession") -LogPath $logPath
+    }
+
+    } finally {
+        if ($session) {
+            Remove-PSSession -Session $session
+        }
+    }
 
     Write-Log -Message ("Installed guest runtime to {0}" -f $result.RuntimePath) -LogPath $logPath
+    Write-Log -Message ("Installed configure network to {0}" -f $result.ConfigureNetworkPath) -LogPath $logPath
     Write-Log -Message ("Installed trace backend placeholder to {0}" -f $result.TraceBackendPlaceholderPath) -LogPath $logPath
+    Write-Log -Message ("Installed trace backend drio to {0}" -f $result.TraceBackendDrioPath) -LogPath $logPath
     Write-Log -Message ("Installed Sysmon config to {0}" -f $result.SysmonConfigPath) -LogPath $logPath
     Write-Log -Message ("Registered startup task {0}" -f $result.TaskName) -LogPath $logPath
     Write-Log -Message ("Guest runtime size={0} bytes, lastWriteTime={1}" -f $result.RuntimeSize, $result.LastWriteTime) -LogPath $logPath

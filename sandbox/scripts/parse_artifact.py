@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import subprocess
 import shutil
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from task_profile import expected_trace_artifacts
@@ -65,7 +66,10 @@ def wsl_to_windows(path: Path) -> str:
 def load_json(path: Path) -> Any:
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    text = path.read_text(encoding="utf-8-sig", errors="replace").replace("\x00", "").strip()
+    if not text:
+        return None
+    return json.loads(text)
 
 
 def load_ndjson(path: Path) -> list[dict[str, Any]]:
@@ -103,10 +107,13 @@ def load_csv(path: Path) -> list[dict[str, str]]:
 def copy_raw_artifacts(src_dir: Path, dst_dir: Path) -> list[str]:
     dst_dir.mkdir(parents=True, exist_ok=True)
     copied = []
-    for item in sorted(src_dir.iterdir()):
+    for item in sorted(src_dir.rglob("*")):
         if item.is_file():
-            shutil.copy2(item, dst_dir / item.name)
-            copied.append(item.name)
+            relative_path = item.relative_to(src_dir)
+            destination = dst_dir / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, destination)
+            copied.append(relative_path.as_posix())
     return copied
 
 
@@ -180,11 +187,238 @@ def to_int(value: Any) -> int | None:
         return None
 
 
+def parse_number_string(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.lower().startswith("0x"):
+            return int(text[2:], 16)
+        return int(text, 10)
+    except Exception:
+        return None
+
+
 def load_event_list(path: Path) -> list[dict[str, Any]]:
     data = load_json(path)
     if isinstance(data, list):
         return data
     return []
+
+
+def parse_drcov_log_process_id(path: Path) -> int | None:
+    match = re.search(r"\.(\d+)\.\d+\.proc\.log$", path.name)
+    if not match:
+        return None
+    return to_int(match.group(1))
+
+
+def parse_drcov_text_log(path: Path) -> dict[str, Any]:
+    modules: dict[int, dict[str, Any]] = {}
+    basic_blocks: list[dict[str, Any]] = []
+    in_module_table = False
+    in_basic_block_table = False
+
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if raw_line.startswith("Module Table:"):
+            in_module_table = True
+            in_basic_block_table = False
+            continue
+        if raw_line.startswith("BB Table:"):
+            in_module_table = False
+            in_basic_block_table = True
+            continue
+
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if in_module_table:
+            if line.startswith("Columns:"):
+                continue
+            parts = re.split(r",\s*", line, maxsplit=9)
+            if len(parts) < 3:
+                continue
+            module_id = parse_number_string(parts[0])
+            if module_id is None:
+                continue
+            if len(parts) >= 10:
+                base_value = parse_number_string(parts[2])
+                end_value = parse_number_string(parts[3])
+                path_value = parts[9].strip()
+            else:
+                base_value = parse_number_string(parts[1])
+                end_value = parse_number_string(parts[2]) if len(parts) >= 3 else None
+                path_value = parts[-1].strip()
+            size_value = 0
+            if base_value is not None and end_value is not None and end_value >= base_value:
+                size_value = end_value - base_value
+            module_name = PureWindowsPath(path_value).stem if path_value else f"module_{module_id}"
+            modules[int(module_id)] = {
+                "module_id": int(module_id),
+                "path": path_value,
+                "module": module_name,
+                "base_value": int(base_value or 0),
+                "base": f"0x{base_value:X}" if base_value is not None else None,
+                "size": int(size_value),
+            }
+            continue
+
+        if in_basic_block_table:
+            if re.match(r"^module id,\s*start,\s*size", line, flags=re.IGNORECASE):
+                continue
+            match = re.match(
+                r"^module\[\s*(\d+)\]\s*:\s*(0x[0-9A-Fa-f]+|\d+)\s*,\s*(0x[0-9A-Fa-f]+|\d+)",
+                line,
+            )
+            if not match:
+                continue
+            module_id = parse_number_string(match.group(1))
+            start_offset = parse_number_string(match.group(2))
+            block_size = parse_number_string(match.group(3))
+            if module_id is None or start_offset is None or block_size is None:
+                continue
+            basic_blocks.append(
+                {
+                    "module_id": int(module_id),
+                    "start_offset": int(start_offset),
+                    "size": int(block_size),
+                    "sequence": len(basic_blocks),
+                }
+            )
+
+    return {
+        "process_id": parse_drcov_log_process_id(path),
+        "log_path": str(path),
+        "modules": [modules[module_id] for module_id in sorted(modules)],
+        "basic_blocks": basic_blocks,
+    }
+
+
+def recover_drio_dynamic_cfg(
+    artifact_dir: Path,
+    trace_request: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], str] | None:
+    drio_dir = artifact_dir / "drio"
+    if not drio_dir.is_dir():
+        return None
+
+    log_paths = sorted(drio_dir.glob("*.log"))
+    if not log_paths:
+        return None
+
+    parsed_logs = [parse_drcov_text_log(path) for path in log_paths]
+    events: list[dict[str, Any]] = [
+        {
+            "event": "trace_status",
+            "trace_mode": trace_request.get("trace_mode", "dynamic_cfg"),
+            "trace_backend": "drio",
+            "status": "drcov_basic_blocks",
+            "message": "Recovered dynamic CFG from raw DynamoRIO drcov logs.",
+            "sample_name": trace_request.get("sample_name"),
+            "launched_pid": trace_request.get("launched_pid"),
+            "started_at": trace_request.get("started_at"),
+            "ended_at": trace_request.get("ended_at"),
+        },
+        {
+            "event": "trace_window",
+            "sample_name": trace_request.get("sample_name"),
+            "launched_pid": trace_request.get("launched_pid"),
+            "started_at": trace_request.get("started_at"),
+            "ended_at": trace_request.get("ended_at"),
+        },
+    ]
+    process_ids: list[int] = []
+
+    for log in parsed_logs:
+        module_map = {int(module["module_id"]): module for module in log.get("modules", [])}
+        log_process_id = to_int(log.get("process_id")) or to_int(trace_request.get("launched_pid"))
+        if log_process_id is not None and log_process_id not in process_ids:
+            process_ids.append(log_process_id)
+        previous_ordered_block: dict[str, str] | None = None
+
+        for module in module_map.values():
+            events.append(
+                {
+                    "event": "module_load",
+                    "module": module.get("module"),
+                    "path": module.get("path"),
+                    "base": module.get("base"),
+                    "size": module.get("size"),
+                    "kind": "drcov_text",
+                    "pid": log_process_id,
+                }
+            )
+
+        for block in log.get("basic_blocks", []):
+            module = module_map.get(int(block["module_id"]))
+            if not module:
+                continue
+            start_value = int(module["base_value"]) + int(block["start_offset"])
+            end_value = start_value + int(block["size"])
+            start_text = f"0x{start_value:X}"
+            end_text = f"0x{end_value:X}"
+
+            events.append(
+                {
+                    "event": "basic_block",
+                    "module": module.get("module"),
+                    "path": module.get("path"),
+                    "start": start_text,
+                    "end": end_text,
+                    "size": block.get("size"),
+                    "kind": "drcov_text",
+                    "pid": log_process_id,
+                }
+            )
+            events.append(
+                {
+                    "event": "sampled_block_execution",
+                    "module": module.get("module"),
+                    "path": module.get("path"),
+                    "thread_id": log_process_id,
+                    "round": 0,
+                    "sequence": block.get("sequence"),
+                    "block_start": start_text,
+                    "block_end": end_text,
+                    "instruction_pointer": start_text,
+                    "pid": log_process_id,
+                    "kind": "drcov_first_seen_order",
+                }
+            )
+            if previous_ordered_block and previous_ordered_block.get("module") == module.get("module"):
+                events.append(
+                    {
+                        "event": "edge",
+                        "module": module.get("module"),
+                        "path": module.get("path"),
+                        "source": previous_ordered_block.get("start"),
+                        "target": start_text,
+                        "pid": log_process_id,
+                        "count": 1,
+                        "kind": "drcov_first_seen_order",
+                    }
+                )
+            previous_ordered_block = {"module": str(module.get("module", "")), "start": start_text}
+
+    basic_block_events = [event for event in events if event.get("event") == "basic_block"]
+    if not basic_block_events:
+        return None
+
+    return (
+        {
+            "status": "drcov_basic_blocks",
+            "drio_mode": "drcov_text_first_seen_order",
+            "process_ids": sorted(process_ids),
+            "notes": [
+                "Recovered dynamic CFG directly from raw drcov logs because trace export files were missing."
+            ],
+        },
+        events,
+        "Recovered dynamic CFG directly from raw drcov logs because the guest did not export trace summary files.",
+    )
 
 
 def count_meaningful_sysmon_events(sysmon_summary: list[dict[str, Any]]) -> int:
@@ -206,6 +440,29 @@ def category_event_count(artifact_dir: Path) -> int:
     return total
 
 
+def should_rebuild_sysmon_categories(
+    artifact_dir: Path,
+    sysmon_summary: list[dict[str, Any]],
+) -> bool:
+    counts_by_event_id: dict[int, int] = {}
+    for row in sysmon_summary:
+        event_id = to_int(row.get("EventId"))
+        count = to_int(row.get("Count")) or 0
+        if event_id is None:
+            continue
+        counts_by_event_id[event_id] = counts_by_event_id.get(event_id, 0) + count
+
+    for name, ids in SYSMON_CATEGORY_IDS.items():
+        expected_count = sum(counts_by_event_id.get(event_id, 0) for event_id in ids)
+        if expected_count <= 0:
+            continue
+        events = load_event_list(artifact_dir / f"{name}.json")
+        if len(events) == 0:
+            return True
+
+    return False
+
+
 def should_materialize_sysmon_from_evtx(artifact_dir: Path) -> bool:
     sysmon_evtx = artifact_dir / "sysmon.evtx"
     if not sysmon_evtx.exists():
@@ -213,6 +470,9 @@ def should_materialize_sysmon_from_evtx(artifact_dir: Path) -> bool:
 
     sysmon_summary = load_json(artifact_dir / "sysmon_summary.json")
     if not isinstance(sysmon_summary, list):
+        return True
+
+    if should_rebuild_sysmon_categories(artifact_dir, sysmon_summary):
         return True
 
     if count_meaningful_sysmon_events(sysmon_summary) > 0:
@@ -280,25 +540,45 @@ function Get-SysmonEventObject {{
     [PSCustomObject]$data
 }}
 
-$events = @(Get-WinEvent -Path $evtxPath -Oldest -ErrorAction Stop)
-$objects = @($events | ForEach-Object {{ Get-SysmonEventObject -Event $_ }})
-$summary = @(
-    $objects |
-        Group-Object Id |
+$maxEvents = 50000
+$events = @(Get-WinEvent -Path $evtxPath -Oldest -MaxEvents $maxEvents -ErrorAction Stop)
+
+$summary = @{{}}
+$categoryData = @{{}}
+$categories = @({category_entries})
+foreach ($category in $categories) {{
+    $categoryData[$category.Name] = @()
+}}
+
+foreach ($event in $events) {{
+    $eventId = $event.Id
+    if (-not $summary.ContainsKey($eventId)) {{
+        $summary[$eventId] = 0
+    }}
+    $summary[$eventId]++
+
+    $obj = Get-SysmonEventObject -Event $event
+    foreach ($category in $categories) {{
+        if ($eventId -in $category.Ids) {{
+            $categoryData[$category.Name] += $obj
+        }}
+    }}
+}}
+
+$summaryArray = @(
+    $summary.GetEnumerator() |
         Sort-Object Name |
         ForEach-Object {{
             [PSCustomObject]@{{
                 EventId = [int]$_.Name
-                Count = $_.Count
+                Count = $_.Value
             }}
         }}
 )
-Export-JsonFile -InputObject $summary -Path (Join-Path $artifactDir 'sysmon_summary.json')
+Export-JsonFile -InputObject $summaryArray -Path (Join-Path $artifactDir 'sysmon_summary.json')
 
-$categories = @({category_entries})
 foreach ($category in $categories) {{
-    $selected = @($objects | Where-Object {{ [int]$_.Id -in $category.Ids }})
-    Export-JsonFile -InputObject $selected -Path (Join-Path $artifactDir ($category.Name + '.json'))
+    Export-JsonFile -InputObject $categoryData[$category.Name] -Path (Join-Path $artifactDir ($category.Name + '.json'))
 }}
 """
     subprocess.run(
@@ -434,6 +714,26 @@ def derive_related_pids_from_snapshot_rows(
             if ppid in related and pid not in related:
                 related.add(pid)
                 changed = True
+    return related
+
+
+def derive_related_pids_from_trace(
+    trace_summary: dict[str, Any] | None,
+    seed_pids: set[int] | None = None,
+) -> set[int]:
+    related = set(seed_pids or set())
+    dynamic_cfg = ((trace_summary or {}).get("dynamic_cfg", {}) or {})
+
+    for pid in dynamic_cfg.get("process_ids", []) or []:
+        parsed = to_int(pid)
+        if parsed is not None:
+            related.add(parsed)
+
+    for thread_entry in dynamic_cfg.get("ordered_threads", []) or []:
+        parsed = to_int(thread_entry.get("thread_id"))
+        if parsed is not None:
+            related.add(parsed)
+
     return related
 
 
@@ -653,15 +953,18 @@ def summarize_trace_artifacts(
 ) -> dict[str, Any]:
     trace_manifest = load_json(artifact_dir / "trace_manifest.json") or {}
     dynamic_cfg_summary = load_json(artifact_dir / "dynamic_cfg_trace_summary.json") or {}
+    trace_request = load_json(artifact_dir / "trace_request.json") or {}
 
     trace_mode = (
         trace_manifest.get("trace_mode")
+        or trace_request.get("trace_mode")
         or task_runtime_context.get("trace_mode")
         or task_profile.get("trace_mode")
         or "none"
     )
     trace_backend = (
         trace_manifest.get("trace_backend")
+        or trace_request.get("trace_backend")
         or task_runtime_context.get("trace_backend")
         or task_profile.get("trace_backend")
         or "none"
@@ -684,17 +987,24 @@ def summarize_trace_artifacts(
         if isinstance(artifact_name, str) and (artifact_dir / artifact_name).exists() and artifact_name not in collected_artifacts:
             collected_artifacts.append(artifact_name)
 
+    recovered_reason = None
     if trace_mode == "dynamic_cfg":
-        dynamic_cfg_summary = summarize_dynamic_cfg_trace(
-            dynamic_cfg_summary,
-            load_ndjson(artifact_dir / "dynamic_cfg_trace.ndjson"),
-        )
+        dynamic_cfg_events = load_ndjson(artifact_dir / "dynamic_cfg_trace.ndjson")
+        if dynamic_cfg_events:
+            dynamic_cfg_summary = summarize_dynamic_cfg_trace(dynamic_cfg_summary, dynamic_cfg_events)
+        elif trace_backend == "drio":
+            recovered = recover_drio_dynamic_cfg(artifact_dir, trace_request)
+            if recovered is not None:
+                recovered_summary, recovered_events, recovered_reason = recovered
+                dynamic_cfg_summary = summarize_dynamic_cfg_trace(recovered_summary, recovered_events)
 
     return {
         "mode": trace_mode,
         "backend": trace_backend,
-        "status": trace_manifest.get("status", "disabled" if trace_mode == "none" else "unknown"),
-        "reason": trace_manifest.get("reason"),
+        "status": trace_manifest.get("status")
+        or dynamic_cfg_summary.get("status")
+        or ("disabled" if trace_mode == "none" else "unknown"),
+        "reason": trace_manifest.get("reason") or recovered_reason,
         "expected_artifacts": expected_artifacts,
         "collected_artifacts": collected_artifacts,
         "dynamic_cfg": dynamic_cfg_summary,
@@ -717,6 +1027,11 @@ def summarize_dynamic_cfg_trace(
     edges: set[tuple[str, str, str]] = set()
     ordered_threads: dict[int, list[dict[str, Any]]] = {}
     notes: list[str] = []
+    call_count = 0
+    ret_count = 0
+    branch_count = 0
+    indirect_call_count = 0
+    indirect_jump_count = 0
 
     def ensure_module_entry(module_name: str, path: Any = None) -> dict[str, Any]:
         entry = modules_by_name.setdefault(
@@ -786,6 +1101,51 @@ def summarize_dynamic_cfg_trace(
                         "architecture": event.get("architecture"),
                     }
                 )
+        elif event_type == "call":
+            source = str(event.get("source", "") or "")
+            target = str(event.get("target", "") or "")
+            if source and target:
+                call_count += 1
+                edge_key = (module_name, source, target)
+                edges.add(edge_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_edges"].add(edge_key)
+        elif event_type == "ret":
+            source = str(event.get("source", "") or "")
+            target = str(event.get("target", "") or "")
+            if source and target:
+                ret_count += 1
+                edge_key = (module_name, source, target)
+                edges.add(edge_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_edges"].add(edge_key)
+        elif event_type == "branch":
+            source = str(event.get("source", "") or "")
+            target = str(event.get("target", "") or "")
+            if source and target:
+                branch_count += 1
+                edge_key = (module_name, source, target)
+                edges.add(edge_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_edges"].add(edge_key)
+        elif event_type == "indirect_call":
+            source = str(event.get("source", "") or "")
+            target = str(event.get("target", "") or "")
+            if source and target:
+                indirect_call_count += 1
+                edge_key = (module_name, source, target)
+                edges.add(edge_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_edges"].add(edge_key)
+        elif event_type == "indirect_jump":
+            source = str(event.get("source", "") or "")
+            target = str(event.get("target", "") or "")
+            if source and target:
+                indirect_jump_count += 1
+                edge_key = (module_name, source, target)
+                edges.add(edge_key)
+                module_entry = ensure_module_entry(module_name, event.get("path"))
+                module_entry["_edges"].add(edge_key)
         elif event_type == "trace_status":
             message = str(event.get("message", "") or "").strip()
             if message:
@@ -798,10 +1158,6 @@ def summarize_dynamic_cfg_trace(
         if note not in existing_notes:
             existing_notes.append(note)
 
-    merged["event_count"] = len(events)
-    merged["basic_block_count"] = len(basic_blocks)
-    merged["edge_count"] = len(edges)
-    merged["module_count"] = len(modules_by_name)
     normalized_ordered_threads = []
     total_ordered_samples = 0
     for thread_id in sorted(ordered_threads):
@@ -821,6 +1177,32 @@ def summarize_dynamic_cfg_trace(
                 "samples": samples,
             }
         )
+
+        previous_sample: dict[str, Any] | None = None
+        for sample in samples:
+            if previous_sample is None:
+                previous_sample = sample
+                continue
+
+            previous_module = str(previous_sample.get("module", "") or "")
+            current_module = str(sample.get("module", "") or "")
+            previous_start = str(previous_sample.get("block_start", "") or "")
+            current_start = str(sample.get("block_start", "") or "")
+            if (
+                previous_module
+                and previous_module == current_module
+                and previous_start
+                and current_start
+                and previous_start != current_start
+            ):
+                edge_key = (current_module, previous_start, current_start)
+                if edge_key not in edges:
+                    edges.add(edge_key)
+                    module_entry = ensure_module_entry(current_module, sample.get("path") or previous_sample.get("path"))
+                    module_entry["_edges"].add(edge_key)
+
+            previous_sample = sample
+
     normalized_modules = []
     for module_entry in modules_by_name.values():
         normalized_modules.append(
@@ -833,10 +1215,32 @@ def summarize_dynamic_cfg_trace(
                 "edge_count": len(module_entry.get("_edges", set())),
             }
         )
+    merged["event_count"] = len(events)
+    merged["basic_block_count"] = len(basic_blocks)
+    merged["edge_count"] = len(edges)
+    merged["module_count"] = len(modules_by_name)
     merged["modules"] = sorted(normalized_modules, key=lambda item: str(item.get("module", "")))
     merged["ordered_block_sample_count"] = total_ordered_samples
     merged["ordered_thread_count"] = len(normalized_ordered_threads)
     merged["ordered_threads"] = normalized_ordered_threads
+
+    # Add control flow statistics
+    if call_count > 0 or ret_count > 0 or branch_count > 0 or indirect_call_count > 0 or indirect_jump_count > 0:
+        merged["call_count"] = call_count
+        merged["ret_count"] = ret_count
+        merged["branch_count"] = branch_count
+        merged["indirect_call_count"] = indirect_call_count
+        merged["indirect_jump_count"] = indirect_jump_count
+        merged["coverage_mode"] = "control_flow_trace"
+        merged["edge_source"] = "instrumented"
+        merged["has_call_graph"] = call_count > 0 or ret_count > 0
+        merged["has_indirect_targets"] = indirect_call_count > 0 or indirect_jump_count > 0
+    else:
+        merged["coverage_mode"] = merged.get("coverage_mode", "basic_blocks_only")
+        merged["edge_source"] = merged.get("edge_source", "inferred_from_order")
+        merged["has_call_graph"] = merged.get("has_call_graph", False)
+        merged["has_indirect_targets"] = merged.get("has_indirect_targets", False)
+
     if existing_notes:
         merged["notes"] = existing_notes
 
@@ -918,8 +1322,13 @@ def build_summary(artifact_dir: Path, copied_files: list[str]) -> dict[str, Any]
     sample_metadata = load_json(artifact_dir / "sample_metadata.json") or {}
     task_profile = load_json(artifact_dir / "task_profile.json") or {}
     task_runtime_context = load_json(artifact_dir / "task_runtime_context.json") or {}
+    trace_request = load_json(artifact_dir / "trace_request.json") or {}
     runner_log = load_runner_log(artifact_dir / "runner.log")
     sysmon_summary = load_json(artifact_dir / "sysmon_summary.json") or []
+
+    for key in ("sample_name", "launched_pid", "started_at", "ended_at"):
+        if key not in task_summary and trace_request.get(key) is not None:
+            task_summary[key] = trace_request.get(key)
 
     process_events = load_event_list(artifact_dir / "sysmon_process_events.json")
     file_events = load_event_list(artifact_dir / "sysmon_file_events.json")
@@ -937,6 +1346,8 @@ def build_summary(artifact_dir: Path, copied_files: list[str]) -> dict[str, Any]
         sample_name,
         related_pids,
     )
+    trace_summary = summarize_trace_artifacts(task_profile, task_runtime_context, artifact_dir)
+    related_pids = derive_related_pids_from_trace(trace_summary, related_pids)
 
     related_process_events = filter_related_events(process_events, related_pids, sample_metadata, sample_name)
     related_file_events = filter_related_events(file_events, related_pids, sample_metadata, sample_name)
@@ -964,7 +1375,6 @@ def build_summary(artifact_dir: Path, copied_files: list[str]) -> dict[str, Any]
         copied_files,
         runner_log,
     )
-    trace_summary = summarize_trace_artifacts(task_profile, task_runtime_context, artifact_dir)
 
     process_behavior = summarize_process_behavior(related_process_events)
     if process_behavior["created_count"] == 0 and related_snapshot_process_rows:

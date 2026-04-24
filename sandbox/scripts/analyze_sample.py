@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
@@ -24,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout-seconds",
         type=int,
-        default=300,
-        help="Maximum task runtime before forced shutdown.",
+        default=None,
+        help="Maximum task runtime before forced shutdown. Auto-selected from task profile when omitted.",
     )
     parser.add_argument(
         "--vm-name",
@@ -38,19 +40,24 @@ def parse_args() -> argparse.Namespace:
         help="Hyper-V snapshot name restored before and after the task.",
     )
     parser.add_argument(
+        "--task-profile",
+        default=None,
+        help="Optional JSON task profile to pass through to run_offline_task.py.",
+    )
+    parser.add_argument(
         "--guest-user",
-        default="analyst",
+        default="root",
         help="Guest Windows username for PowerShell Direct when --install-runtime is used.",
+    )
+    parser.add_argument(
+        "--guest-password",
+        default="root",
+        help="Guest Windows password for PowerShell Direct when --install-runtime is used.",
     )
     parser.add_argument(
         "--install-runtime",
         action="store_true",
         help="Push the current guest runtime and Sysmon config into the running guest before analysis.",
-    )
-    parser.add_argument(
-        "--task-profile",
-        default=None,
-        help="Optional JSON task profile to stage into the sample ISO for this run.",
     )
     return parser.parse_args()
 
@@ -73,6 +80,7 @@ def main() -> int:
     install_runtime_script = root / "sandbox" / "scripts" / "install_guest_runtime.py"
     run_task_script = root / "sandbox" / "scripts" / "run_offline_task.py"
     collect_report_script = root / "sandbox" / "scripts" / "collect_report.py"
+    result_server_script = root / "sandbox" / "scripts" / "result_server.py"
 
     if args.install_runtime:
         run(
@@ -83,24 +91,66 @@ def main() -> int:
                 args.vm_name,
                 "--guest-user",
                 args.guest_user,
+                "--guest-password",
+                args.guest_password,
             ],
             cwd=root,
         )
 
-    run_cmd = [
-        sys.executable,
-        str(run_task_script),
-        args.sample,
-        "--vm-name",
-        args.vm_name,
-        "--snapshot-name",
-        args.snapshot_name,
-        "--timeout-seconds",
-        str(args.timeout_seconds),
-    ]
-    if args.task_profile:
-        run_cmd.extend(["--task-profile", args.task_profile])
-    run(run_cmd, cwd=root)
+    # Start ResultServer in background
+    result_server_output_dir = root / "tmp" / "result_server_artifacts"
+    result_server_output_dir.mkdir(parents=True, exist_ok=True)
+
+    result_server_proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(result_server_script),
+            "--host", "192.168.100.1",
+            "--port", "2042",
+            "--output-dir", str(result_server_output_dir),
+        ],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    # Give ResultServer time to start
+    time.sleep(2)
+
+    try:
+        run_cmd = [
+            sys.executable,
+            str(run_task_script),
+            args.sample,
+            "--vm-name",
+            args.vm_name,
+            "--snapshot-name",
+            args.snapshot_name,
+            *(
+                [
+                    "--timeout-seconds",
+                    str(args.timeout_seconds),
+                ]
+                if args.timeout_seconds is not None
+                else []
+            ),
+            *(
+                [
+                    "--task-profile",
+                    args.task_profile,
+                ]
+                if args.task_profile
+                else []
+            ),
+        ]
+        run(run_cmd, cwd=root)
+    finally:
+        # Stop ResultServer
+        result_server_proc.terminate()
+        try:
+            result_server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            result_server_proc.kill()
 
     collect_cmd = [
         sys.executable,

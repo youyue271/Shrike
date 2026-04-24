@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $runnerLog = "C:\Sandbox\output\runner.log"
 $localOutputRoot = "C:\Sandbox\output"
 $executionWindowSeconds = 120
-$mediaWaitTimeoutSeconds = 90
+$mediaWaitTimeoutSeconds = 120
 $mediaPollIntervalSeconds = 3
 $bootStabilizationSeconds = 30
 
@@ -346,17 +346,33 @@ function Find-OfflineTaskMedia {
     $sampleDrive = $null
     $artifactDrive = $null
 
-    foreach ($vol in Get-Volume) {
+    Write-RunnerLog "=== Searching for media ==="
+    $volumes = @(Get-Volume)
+    Write-RunnerLog ("Found {0} volumes total" -f $volumes.Count)
+
+    foreach ($vol in $volumes) {
+        $letter = $vol.DriveLetter
+        $label = $vol.FileSystemLabel
+        $type = $vol.DriveType
+        Write-RunnerLog ("Volume: DriveLetter={0} Label='{1}' Type={2}" -f $letter, $label, $type)
+
         if ($vol.DriveLetter) {
             $root = "$($vol.DriveLetter):\"
-            if ((-not $sampleDrive) -and (Test-Path (Join-Path $root "sample"))) {
+            $hasSampleFolder = Test-Path (Join-Path $root "sample")
+            Write-RunnerLog ("  Checking {0} for 'sample' folder: {1}" -f $root, $hasSampleFolder)
+
+            if ((-not $sampleDrive) -and $hasSampleFolder) {
                 $sampleDrive = "$($vol.DriveLetter):"
+                Write-RunnerLog ("  -> Found sample drive: {0}" -f $sampleDrive)
             }
-            if ((-not $artifactDrive) -and (Test-Path (Join-Path $root "artifact"))) {
+            if ((-not $artifactDrive) -and ($vol.FileSystemLabel -eq "ARTIFACT")) {
                 $artifactDrive = "$($vol.DriveLetter):"
+                Write-RunnerLog ("  -> Found artifact drive: {0}" -f $artifactDrive)
             }
         }
     }
+
+    Write-RunnerLog ("Media search result: SampleDrive={0} ArtifactDrive={1}" -f $sampleDrive, $artifactDrive)
 
     return [PSCustomObject]@{
         SampleDrive = $sampleDrive
@@ -371,7 +387,26 @@ function Wait-ForOfflineTaskMedia {
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $attemptCount = 0
+
     do {
+        $attemptCount++
+
+        # Try to refresh CD-ROM drives to force media detection
+        if ($attemptCount -eq 1 -or ($attemptCount % 5) -eq 0) {
+            try {
+                $shell = New-Object -ComObject Shell.Application
+                $drives = Get-WmiObject Win32_CDROMDrive
+                foreach ($drive in $drives) {
+                    try {
+                        $drive.Drive | Out-Null
+                    } catch {}
+                }
+            } catch {
+                Write-RunnerLog ("CD-ROM refresh attempt failed: {0}" -f $_.Exception.Message)
+            }
+        }
+
         $media = Find-OfflineTaskMedia
         if ($media.SampleDrive -and $media.ArtifactDrive) {
             return $media
@@ -438,7 +473,9 @@ function Export-TraceArtifacts {
         [string]$SamplePath,
         [int]$LaunchedPid,
         [datetime]$StartedAt,
-        [datetime]$EndedAt
+        [datetime]$EndedAt,
+        [string]$DrioLogDir = $null,
+        [bool]$BypassAntidebug = $false
     )
 
     $traceMode = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "trace_mode" -Default "none"
@@ -457,6 +494,8 @@ function Export-TraceArtifacts {
         launched_pid = $LaunchedPid
         started_at = $StartedAt.ToString("o")
         ended_at = $EndedAt.ToString("o")
+        drio_log_dir = $DrioLogDir
+        bypass_antidebug_requested = $BypassAntidebug
     }
     Export-JsonFile -InputObject $traceRequest -Path (Join-Path $ArtifactDir "trace_request.json")
     Write-RunnerLog "exported trace_request.json"
@@ -479,20 +518,29 @@ function Export-TraceArtifacts {
         $traceSummaryPath = Join-Path $ArtifactDir "dynamic_cfg_trace_summary.json"
         $traceDiagnosticPath = Join-Path $ArtifactDir "trace_backend_diagnostic.json"
 
-        if ($traceMode -eq "dynamic_cfg" -and $traceBackend -eq "placeholder") {
-            $placeholderBackendScript = "C:\Sandbox\runtime\trace_backend_placeholder.ps1"
-            if (-not (Test-Path $placeholderBackendScript)) {
+        if ($traceMode -eq "dynamic_cfg" -and ($traceBackend -eq "placeholder" -or $traceBackend -eq "drio")) {
+            $backendScript = if ($traceBackend -eq "drio") {
+                "C:\Sandbox\runtime\trace_backend_drio.ps1"
+            } else {
+                "C:\Sandbox\runtime\trace_backend_placeholder.ps1"
+            }
+
+            if (-not (Test-Path $backendScript)) {
                 $traceStatus = "backend_missing"
-                $traceReason = ("trace backend script not found: {0}" -f $placeholderBackendScript)
+                $traceReason = ("trace backend script not found: {0}" -f $backendScript)
                 Write-RunnerLog $traceReason
             } else {
-                Write-RunnerLog ("invoking trace backend script={0}" -f $placeholderBackendScript)
-                $backendDiagnostic.command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Sandbox\runtime\trace_backend_placeholder.ps1"
+                Write-RunnerLog ("invoking trace backend script={0}" -f $backendScript)
+
+                # Pre-compute paths to avoid null issues in ArgumentList
+                $requestJsonPath = Join-Path $ArtifactDir "trace_request.json"
+
+                $backendDiagnostic.command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File $backendScript -RequestPath $requestJsonPath -OutputPath $traceOutputPath -SummaryPath $traceSummaryPath"
                 $backendResult = Invoke-NativeCommandSafe -FilePath "powershell.exe" -ArgumentList @(
                     "-NoProfile",
                     "-ExecutionPolicy", "Bypass",
-                    "-File", $placeholderBackendScript,
-                    "-RequestPath", (Join-Path $ArtifactDir "trace_request.json"),
+                    "-File", $backendScript,
+                    "-RequestPath", $requestJsonPath,
                     "-OutputPath", $traceOutputPath,
                     "-SummaryPath", $traceSummaryPath
                 )
@@ -571,6 +619,7 @@ try {
 
     if (-not $sampleDrive -or -not $artifactDrive) {
         Write-RunnerLog "sample or artifact media not present; exiting without analysis"
+        Stop-Computer -Force
         exit 0
     }
 
@@ -598,15 +647,26 @@ try {
 
     Wait-ForBootStabilization -Seconds $bootStabilizationSeconds
 
+    # Configure network for ResultServer communication (non-fatal)
+    Write-RunnerLog "configuring network for ResultServer"
+    try {
+        & "$PSScriptRoot\configure_network.ps1" -ErrorAction SilentlyContinue
+        Write-RunnerLog "network configuration completed"
+    } catch {
+        Write-RunnerLog "network configuration skipped: $_"
+    }
+
     $sampleDir = Join-Path $sampleDrive "sample"
     $artifactDir = Join-Path $artifactDrive "artifact"
+    $stagingDir = Join-Path $localOutputRoot "staging"
     $localInput = "C:\Sandbox\input"
 
     New-Item -ItemType Directory -Force $localInput | Out-Null
     New-Item -ItemType Directory -Force $artifactDir | Out-Null
+    New-Item -ItemType Directory -Force $stagingDir | Out-Null
     Get-ChildItem -Path $localInput -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-    Export-SnapshotBundle -Prefix "pre" -ArtifactDir $artifactDir
+    Export-SnapshotBundle -Prefix "pre" -ArtifactDir $stagingDir
 
     Get-ChildItem $sampleDir | Copy-Item -Destination $localInput -Force
     Write-RunnerLog "copied sample to local input"
@@ -618,7 +678,67 @@ try {
     $sampleHash = Get-FileHash -Path $sample.FullName -Algorithm SHA256
     Write-RunnerLog ("launching sample {0}" -f $sample.FullName)
 
-    $proc = Start-Process -FilePath $sample.FullName -PassThru
+    $drioLogDir = $null
+    $bypassAntidebug = $false
+    $traceBackendName = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_backend" -Default "none"
+    $traceModeName = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_mode" -Default "none"
+
+    if ($traceModeName -eq "dynamic_cfg" -and $traceBackendName -eq "drio") {
+        $drioLogDir = Join-Path $localOutputRoot "drio_logs"
+        New-Item -ItemType Directory -Force $drioLogDir | Out-Null
+
+        $is32bit = $false
+        try {
+            $fs = [System.IO.File]::Open($sample.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $br = New-Object System.IO.BinaryReader($fs)
+            $fs.Seek(0x3C, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $peOffset = $br.ReadInt32()
+            $fs.Seek($peOffset + 4, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $machine = $br.ReadUInt16()
+            if ($machine -eq 0x014C) { $is32bit = $true }
+            $fs.Dispose()
+        } catch {
+            Write-RunnerLog ("PE header read failed: {0}; assuming 64-bit" -f $_.Exception.Message)
+        }
+
+        $drrunExe = if ($is32bit) { "C:\Tools\DynamoRIO\bin32\drrun.exe" } else { "C:\Tools\DynamoRIO\bin64\drrun.exe" }
+        $clientDll = if ($is32bit) { "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll" } else { "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll" }
+
+        if ((Test-Path $drrunExe) -and (Test-Path $clientDll)) {
+            $backendOpts = Get-TaskProfileValue -TaskProfile $taskProfile -Name "backend_options" -Default @{}
+            $bypassAntidebug = $false
+            if ($backendOpts) {
+                $prop = $backendOpts.PSObject.Properties["bypass_antidebug"]
+                if ($prop -and $prop.Value -eq $true) { $bypassAntidebug = $true }
+            }
+
+            $drrunArgs = @("-c", $clientDll, "-logdir", $drioLogDir, "-result_server_host", "192.168.100.1", "-result_server_port", "2042")
+            if ($bypassAntidebug) {
+                $drrunArgs += "-bypass_antidebug"
+            }
+            $drrunArgs += @("--", $sample.FullName)
+
+            Write-RunnerLog ("launching via drrun: {0} {1}" -f $drrunExe, ($drrunArgs -join " "))
+            $proc = Start-Process -FilePath $drrunExe -ArgumentList $drrunArgs -PassThru
+        } else {
+            Write-RunnerLog ("drrun or client DLL not found (drrun={0} client={1}); launching sample directly" -f $drrunExe, $clientDll)
+            $launchPath = $sample.FullName
+            if (-not $sample.Extension) {
+                $launchPath = Join-Path $sample.DirectoryName ("{0}.exe" -f $sample.Name)
+                Copy-Item -Path $sample.FullName -Destination $launchPath -Force
+                Write-RunnerLog ("created .exe copy for extensionless sample: {0}" -f $launchPath)
+            }
+            $proc = Start-Process -FilePath $launchPath -PassThru
+        }
+    } else {
+        $launchPath = $sample.FullName
+        if (-not $sample.Extension) {
+            $launchPath = Join-Path $sample.DirectoryName ("{0}.exe" -f $sample.Name)
+            Copy-Item -Path $sample.FullName -Destination $launchPath -Force
+            Write-RunnerLog ("created .exe copy for extensionless sample: {0}" -f $launchPath)
+        }
+        $proc = Start-Process -FilePath $launchPath -PassThru
+    }
     Write-RunnerLog ("launched sample pid={0}" -f $proc.Id)
     $plannedTraceEnd = $start.AddSeconds($executionWindowSeconds)
 
@@ -630,11 +750,11 @@ try {
         launched_pid = $proc.Id
         execution_window_seconds = $executionWindowSeconds
     }
-    Export-JsonFile -InputObject $sampleMetadata -Path (Join-Path $artifactDir "sample_metadata.json")
+    Export-JsonFile -InputObject $sampleMetadata -Path (Join-Path $stagingDir "sample_metadata.json")
     Write-RunnerLog "exported sample_metadata.json"
 
     if ($taskProfile) {
-        Export-JsonFile -InputObject $taskProfile -Path (Join-Path $artifactDir "task_profile.json")
+        Export-JsonFile -InputObject $taskProfile -Path (Join-Path $stagingDir "task_profile.json")
         Write-RunnerLog "exported task_profile.json"
     }
 
@@ -647,27 +767,47 @@ try {
         user_simulation = Get-TaskProfileValue -TaskProfile $taskProfile -Name "user_simulation" -Default "none"
         profile_name = Get-TaskProfileValue -TaskProfile $taskProfile -Name "profile_name" -Default "default"
     }
-    Export-JsonFile -InputObject $taskRuntimeContext -Path (Join-Path $artifactDir "task_runtime_context.json")
+    Export-JsonFile -InputObject $taskRuntimeContext -Path (Join-Path $stagingDir "task_runtime_context.json")
     Write-RunnerLog "exported task_runtime_context.json"
 
-    Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd
+    if ($traceBackendName -ne "drio") {
+        Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+    }
 
     Start-Sleep -Seconds $executionWindowSeconds
 
     $end = Get-Date
     Write-RunnerLog "execution window ended"
 
-    Export-SnapshotBundle -Prefix "post" -ArtifactDir $artifactDir
+    try {
+        $sampleProc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+        if ($sampleProc -and -not $sampleProc.HasExited) {
+            $sampleProc.Kill()
+            Write-RunnerLog ("killed sample process pid={0}" -f $proc.Id)
+        }
+    } catch {}
+    try {
+        Get-Process | Where-Object { $_.Path -and $_.Path -like "*\Sandbox\input\*" } | ForEach-Object {
+            $_.Kill()
+            Write-RunnerLog ("killed child process pid={0} path={1}" -f $_.Id, $_.Path)
+        }
+    } catch {}
+
+    if ($traceBackendName -eq "drio") {
+        Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+    }
+
+    Export-SnapshotBundle -Prefix "post" -ArtifactDir $stagingDir
 
     try {
-        wevtutil epl Microsoft-Windows-Sysmon/Operational (Join-Path $artifactDir "sysmon.evtx")
+        wevtutil epl Microsoft-Windows-Sysmon/Operational (Join-Path $stagingDir "sysmon.evtx")
         Write-RunnerLog "exported sysmon.evtx"
     } catch {
         Write-RunnerLog ("sysmon export failed: {0}" -f $_.Exception.Message)
     }
 
     try {
-        wevtutil epl Microsoft-Windows-PowerShell/Operational (Join-Path $artifactDir "powershell_operational.evtx")
+        wevtutil epl Microsoft-Windows-PowerShell/Operational (Join-Path $stagingDir "powershell_operational.evtx")
         Write-RunnerLog "exported powershell_operational.evtx"
     } catch {
         Write-RunnerLog ("powershell operational export failed: {0}" -f $_.Exception.Message)
@@ -699,7 +839,7 @@ try {
             sample_name = $sample.Name
             launched_pid = $proc.Id
         }
-    ) -Path (Join-Path $artifactDir "sysmon_diagnostic.json")
+    ) -Path (Join-Path $stagingDir "sysmon_diagnostic.json")
     Write-RunnerLog "exported sysmon_diagnostic.json"
 
     $sysmonSummary = $sysmonEvents |
@@ -711,15 +851,15 @@ try {
                 Count = $_.Count
             }
         }
-    Export-JsonFile -InputObject @($sysmonSummary) -Path (Join-Path $artifactDir "sysmon_summary.json")
+    Export-JsonFile -InputObject @($sysmonSummary) -Path (Join-Path $stagingDir "sysmon_summary.json")
     Write-RunnerLog "exported sysmon_summary.json"
 
-    Export-SysmonCategory -Events $sysmonEvents -Ids @(1, 5) -BaseName "sysmon_process_events" -ArtifactDir $artifactDir
-    Export-SysmonCategory -Events $sysmonEvents -Ids @(3, 22) -BaseName "sysmon_network_dns_events" -ArtifactDir $artifactDir
-    Export-SysmonCategory -Events $sysmonEvents -Ids @(2, 11, 15, 23, 26, 29) -BaseName "sysmon_file_events" -ArtifactDir $artifactDir
-    Export-SysmonCategory -Events $sysmonEvents -Ids @(12, 13, 14) -BaseName "sysmon_registry_events" -ArtifactDir $artifactDir
-    Export-SysmonCategory -Events $sysmonEvents -Ids @(8, 10, 25) -BaseName "sysmon_injection_events" -ArtifactDir $artifactDir
-    Export-SysmonCategory -Events $sysmonEvents -Ids @(17, 18, 19, 20, 21) -BaseName "sysmon_ipc_wmi_events" -ArtifactDir $artifactDir
+    Export-SysmonCategory -Events $sysmonEvents -Ids @(1, 5) -BaseName "sysmon_process_events" -ArtifactDir $stagingDir
+    Export-SysmonCategory -Events $sysmonEvents -Ids @(3, 22) -BaseName "sysmon_network_dns_events" -ArtifactDir $stagingDir
+    Export-SysmonCategory -Events $sysmonEvents -Ids @(2, 11, 15, 23, 26, 29) -BaseName "sysmon_file_events" -ArtifactDir $stagingDir
+    Export-SysmonCategory -Events $sysmonEvents -Ids @(12, 13, 14) -BaseName "sysmon_registry_events" -ArtifactDir $stagingDir
+    Export-SysmonCategory -Events $sysmonEvents -Ids @(8, 10, 25) -BaseName "sysmon_injection_events" -ArtifactDir $stagingDir
+    Export-SysmonCategory -Events $sysmonEvents -Ids @(17, 18, 19, 20, 21) -BaseName "sysmon_ipc_wmi_events" -ArtifactDir $stagingDir
 
     @{
         started_at = $start.ToString("o")
@@ -732,10 +872,13 @@ try {
         sysmon_event_count = $sysmonEvents.Count
     } |
         ConvertTo-Json |
-        Set-Content (Join-Path $artifactDir "task_summary.json")
+        Set-Content (Join-Path $stagingDir "task_summary.json")
     Write-RunnerLog "exported task_summary.json"
 
-    Copy-Item $runnerLog -Destination (Join-Path $artifactDir "runner.log") -Force
+    Copy-Item $runnerLog -Destination (Join-Path $stagingDir "runner.log") -Force
+
+    Write-RunnerLog "copying staging to artifact disk"
+    Get-ChildItem -Path $stagingDir -Force -ErrorAction SilentlyContinue | Copy-Item -Destination $artifactDir -Recurse -Force -ErrorAction SilentlyContinue
 
     Stop-Computer -Force
 } catch {

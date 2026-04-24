@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import argparse
 import subprocess
-import sys
 from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Install the project guest runtime and Sysmon config into the Hyper-V guest from WSL."
+        description="Install a DynamoRIO runtime package into the Hyper-V guest from WSL."
     )
+    parser.add_argument("package_path", help="Path to the DynamoRIO Windows zip package.")
     parser.add_argument("--vm-name", default="rw-sandbox-win10", help="Hyper-V VM name.")
-    parser.add_argument("--guest-user", default="root", help="Guest Windows username for PowerShell Direct.")
-    parser.add_argument("--guest-password", default="root", help="Guest Windows password for PowerShell Direct.")
+    parser.add_argument("--guest-user", default="analyst", help="Guest Windows username for PowerShell Direct.")
+    parser.add_argument("--guest-install-root", default=r"C:\Tools\DynamoRIO", help="Target install root inside the guest.")
+    parser.add_argument("--force", action="store_true", help="Replace an existing guest DynamoRIO install.")
     return parser.parse_args()
 
 
@@ -35,7 +36,8 @@ def wsl_to_windows(path: Path) -> str:
 def main() -> int:
     args = parse_args()
     root = project_root()
-    script = root / "windows_host" / "powershell" / "06_install_guest_runtime.ps1"
+    script = root / "windows_host" / "powershell" / "10_install_drio.ps1"
+    package_path = Path(args.package_path).expanduser().resolve()
 
     cmd = [
         "powershell.exe",
@@ -48,9 +50,13 @@ def main() -> int:
         args.vm_name,
         "-GuestUser",
         args.guest_user,
-        "-GuestPassword",
-        args.guest_password,
+        "-DynamoRIOZipPath",
+        wsl_to_windows(package_path),
+        "-GuestInstallRoot",
+        args.guest_install_root,
     ]
+    if args.force:
+        cmd.append("-Force")
 
     print("+", " ".join(cmd))
     result = subprocess.run(cmd, check=False)

@@ -21,7 +21,7 @@ TRACE_ARTIFACTS_BY_MODE: dict[str, list[str]] = {
 
 SUPPORTED_TRACE_BACKENDS: dict[str, set[str]] = {
     "none": {"none"},
-    "dynamic_cfg": {"placeholder"},
+    "dynamic_cfg": {"drio", "placeholder"},
 }
 
 ALLOWED_CAPTURE_FLAGS = {
@@ -31,9 +31,49 @@ ALLOWED_CAPTURE_FLAGS = {
     "register_snapshots",
 }
 
+DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_VM_BOOT_GRACE_SECONDS = 60
+DEFAULT_ARTIFACT_EXPORT_SLACK_SECONDS = 120
+TRACE_MODE_EXPORT_SLACK_SECONDS: dict[str, int] = {
+    "dynamic_cfg": 60,
+}
+TRACE_BACKEND_EXPORT_SLACK_SECONDS: dict[str, int] = {
+    "drio": 60,
+}
+
 
 def expected_trace_artifacts(trace_mode: str) -> list[str]:
     return list(TRACE_ARTIFACTS_BY_MODE.get(trace_mode, TRACE_ARTIFACTS_BY_MODE["none"]))
+
+
+def _coerce_nonnegative_int(value: Any, default: int) -> int:
+    try:
+        result = int(str(value))
+    except Exception:
+        return default
+    return result if result >= 0 else default
+
+
+def recommended_timeout_seconds(
+    task_profile: dict[str, Any] | None,
+    default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    vm_boot_grace_seconds: int = DEFAULT_VM_BOOT_GRACE_SECONDS,
+    artifact_export_slack_seconds: int = DEFAULT_ARTIFACT_EXPORT_SLACK_SECONDS,
+) -> int:
+    if not isinstance(task_profile, dict) or not task_profile:
+        return default_timeout_seconds
+
+    trace_mode = str(task_profile.get("trace_mode", "none") or "none")
+    trace_backend = str(task_profile.get("trace_backend", "none") or "none")
+    execution_window_seconds = _coerce_nonnegative_int(task_profile.get("execution_window_seconds"), 0)
+    boot_stabilization_seconds = _coerce_nonnegative_int(task_profile.get("boot_stabilization_seconds"), 0)
+    export_slack_seconds = (
+        artifact_export_slack_seconds
+        + TRACE_MODE_EXPORT_SLACK_SECONDS.get(trace_mode, 0)
+        + TRACE_BACKEND_EXPORT_SLACK_SECONDS.get(trace_backend, 0)
+    )
+    recommended = vm_boot_grace_seconds + boot_stabilization_seconds + execution_window_seconds + export_slack_seconds
+    return max(default_timeout_seconds, recommended)
 
 
 def validate_task_profile_dict(data: dict[str, Any]) -> None:

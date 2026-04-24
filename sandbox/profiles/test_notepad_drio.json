@@ -1,19 +1,20 @@
 {
-  "profile_name": "deep_cfg_baseline",
+  "profile_name": "test_notepad_drio",
   "trace_mode": "dynamic_cfg",
-  "trace_backend": "placeholder",
+  "trace_backend": "drio",
   "network_mode": "airgap",
   "user_simulation": "none",
-  "execution_window_seconds": 180,
+  "execution_window_seconds": 10,
   "boot_stabilization_seconds": 30,
   "backend_options": {
-    "sample_rounds": 24,
-    "sample_sleep_milliseconds": 5
+    "sample_rounds": 3,
+    "sample_sleep_milliseconds": 10,
+    "bypass_antidebug": false
   },
   "capture": {
     "cfg": true,
     "dfg": false,
-    "memory_writes": true,
+    "memory_writes": false,
     "register_snapshots": false
   }
 }

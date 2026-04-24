@@ -29,6 +29,8 @@ Baseline policy:
    Restores `maintenance-base`, starts the VM, and optionally opens `vmconnect` for manual guest maintenance.
 9. `09_show_sandbox_state.ps1`
    Prints a JSON status view of VM state, snapshots, attached media, and whether the sandbox is ready for automated analysis.
+10. `10_install_drio.ps1`
+   Copies a DynamoRIO Windows zip package into the running guest through Hyper-V guest services, extracts it, and validates that `drrun.exe` is present.
 
 ## Typical usage
 
@@ -46,7 +48,8 @@ Install guest runtime after Windows is installed and the VM is booted:
 
 ```powershell
 .\08_start_maintenance.ps1
-.\06_install_guest_runtime.ps1 -GuestUser "analyst"
+.\06_install_guest_runtime.ps1 -GuestUser "root" -GuestPassword "root"
+.\10_install_drio.ps1 -GuestUser "root" -DynamoRIOZipPath "windows_host\third_party\DynamoRIO-Windows.zip"
 Stop-VM -Name "rw-sandbox-win10" -TurnOff -Force
 .\07_refresh_snapshots.ps1 -Force
 ```

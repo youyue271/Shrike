@@ -1,14 +1,15 @@
 {
-  "profile_name": "deep_cfg_baseline",
+  "profile_name": "deep_cfg_drio",
   "trace_mode": "dynamic_cfg",
-  "trace_backend": "placeholder",
+  "trace_backend": "drio",
   "network_mode": "airgap",
   "user_simulation": "none",
   "execution_window_seconds": 180,
   "boot_stabilization_seconds": 30,
   "backend_options": {
     "sample_rounds": 24,
-    "sample_sleep_milliseconds": 5
+    "sample_sleep_milliseconds": 5,
+    "bypass_antidebug": true
   },
   "capture": {
     "cfg": true,
