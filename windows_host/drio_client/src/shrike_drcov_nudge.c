@@ -67,6 +67,7 @@ typedef struct _PEB {
 #define DUMP_AFTER_EVENT_THRESHOLD 50000
 #define MAX_PROBE_EVENTS 128
 #define SAMPLE_PATH_CAP 260
+#define MAX_DYNAMIC_EXEC_REGIONS 64
 
 typedef struct _trace_event_t {
     uint64 timestamp;
@@ -94,6 +95,7 @@ typedef struct _per_thread_t {
     uint64 event_count;
 #ifdef WINDOWS
     SOCKET result_socket;
+    bool result_socket_disabled;
 #endif
 } per_thread_t;
 
@@ -101,6 +103,7 @@ static bool g_initialized;
 static bool g_dump_requested;
 static volatile int g_total_event_count;
 static int tls_idx;
+static bool g_enable_peb_unlinking;
 static const char *g_logdir;
 static const char *g_logprefix;
 static bool g_dump_text;
@@ -111,6 +114,9 @@ static int g_probe_event_count;
 static app_pc g_sample_base;
 static app_pc g_sample_end;
 static char g_sample_path[SAMPLE_PATH_CAP];
+static app_pc g_dynamic_exec_region_base[MAX_DYNAMIC_EXEC_REGIONS];
+static app_pc g_dynamic_exec_region_end[MAX_DYNAMIC_EXEC_REGIONS];
+static int g_dynamic_exec_region_count;
 static const char *g_result_server_host;
 static int g_result_server_port;
 
@@ -245,6 +251,35 @@ string_contains_case_insensitive(const char *haystack, const char *needle)
     return false;
 }
 
+static bool
+is_probable_drio_module_name(const char *name)
+{
+    if (name == NULL) {
+        return false;
+    }
+
+    return string_contains_case_insensitive(name, "dynamorio") ||
+           string_contains_case_insensitive(name, "drwrap") ||
+           string_contains_case_insensitive(name, "drmgr") ||
+           string_contains_case_insensitive(name, "drutil") ||
+           string_contains_case_insensitive(name, "shrike_drcov_nudge");
+}
+
+static bool
+is_probable_sample_module_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+    if (is_probable_drio_module_name(name)) {
+        return false;
+    }
+    if (string_contains_case_insensitive(name, ".dll")) {
+        return false;
+    }
+    return true;
+}
+
 static void
 json_escape_string(const char *src, char *dst, size_t dst_size)
 {
@@ -368,6 +403,88 @@ maybe_log_sample_execution(app_pc pc)
     }
 }
 
+static bool
+should_trace_sample_pc(app_pc pc)
+{
+    if (!g_sample_module_seen || g_sample_base == NULL || g_sample_end == NULL || pc == NULL) {
+        return false;
+    }
+    return pc >= g_sample_base && pc < g_sample_end;
+}
+
+static void
+maybe_log_dynamic_exec_region(app_pc base, size_t size)
+{
+    char buf[512];
+    int len, i;
+    app_pc end;
+
+    if (base == NULL || size == 0) {
+        return;
+    }
+    end = base + size;
+    for (i = 0; i < g_dynamic_exec_region_count; ++i) {
+        if (base == g_dynamic_exec_region_base[i] && end == g_dynamic_exec_region_end[i]) {
+            return;
+        }
+    }
+    if (g_dynamic_exec_region_count >= MAX_DYNAMIC_EXEC_REGIONS) {
+        return;
+    }
+
+    g_dynamic_exec_region_base[g_dynamic_exec_region_count] = base;
+    g_dynamic_exec_region_end[g_dynamic_exec_region_count] = end;
+    g_dynamic_exec_region_count++;
+
+    len = dr_snprintf(buf, sizeof(buf),
+                     "{\"event\":\"module_load\",\"path\":\"dynamic_exec_region_0x%llx\",\"base\":\"0x%llx\",\"end\":\"0x%llx\",\"size\":%llu}",
+                     (unsigned long long)base,
+                     (unsigned long long)base,
+                     (unsigned long long)end,
+                     (unsigned long long)size);
+    if (len > 0 && len < sizeof(buf)) {
+        write_probe_event_json(buf);
+    }
+}
+
+static bool
+should_trace_dynamic_exec_pc(app_pc pc)
+{
+    byte *base_pc;
+    size_t size;
+    uint prot;
+    module_data_t *mod;
+
+    if (!g_sample_module_seen || pc == NULL) {
+        return false;
+    }
+
+    mod = dr_lookup_module(pc);
+    if (mod != NULL) {
+        dr_free_module_data(mod);
+        return false;
+    }
+
+    base_pc = NULL;
+    size = 0;
+    prot = 0;
+    if (!dr_query_memory(pc, &base_pc, &size, &prot)) {
+        return false;
+    }
+    if ((prot & DR_MEMPROT_EXEC) == 0) {
+        return false;
+    }
+
+    maybe_log_dynamic_exec_region(base_pc, size);
+    return true;
+}
+
+static bool
+should_trace_interesting_pc(app_pc pc)
+{
+    return should_trace_sample_pc(pc) || should_trace_dynamic_exec_pc(pc);
+}
+
 static void
 write_exception_dispatch_event(const char *api_name, ULONG code, PVOID address, ULONG flags)
 {
@@ -424,6 +541,45 @@ write_exception_handler_install_event(const char *api_name, PVOID handler, BOOL 
     }
 }
 
+static bool
+is_windows_execute_protect(ULONG protect)
+{
+    ULONG base_protect = protect & 0xff;
+    return base_protect == PAGE_EXECUTE ||
+           base_protect == PAGE_EXECUTE_READ ||
+           base_protect == PAGE_EXECUTE_READWRITE ||
+           base_protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static void
+write_memory_region_event(const char *api_name, PVOID base, SIZE_T size, ULONG protect, BOOL success)
+{
+    char buf[768];
+    int len;
+    BOOL executable = is_windows_execute_protect(protect);
+
+    if (!success || base == NULL || size == 0) {
+        return;
+    }
+
+    len = dr_snprintf(buf, sizeof(buf),
+                     "{\"event\":\"memory_region\",\"api\":\"%s\",\"base\":\"0x%llx\",\"size\":%llu,\"protect\":\"0x%08x\",\"executable\":%s,\"tid\":%u,\"ts\":%llu}",
+                     api_name ? api_name : "unknown",
+                     (unsigned long long)(ptr_uint_t)base,
+                     (unsigned long long)size,
+                     (unsigned int)protect,
+                     executable ? "true" : "false",
+                     dr_get_thread_id(dr_get_current_drcontext()),
+                     (unsigned long long)dr_get_microseconds());
+    if (len > 0 && len < sizeof(buf)) {
+        write_probe_event_json(buf);
+    }
+
+    if (executable) {
+        maybe_log_dynamic_exec_region((app_pc)base, (size_t)size);
+    }
+}
+
 static void
 flush_trace_buffer(void *drcontext, per_thread_t *data)
 {
@@ -438,9 +594,12 @@ flush_trace_buffer(void *drcontext, per_thread_t *data)
 
 #ifdef WINDOWS
     /* Use socket if result server is configured */
-    if (g_result_server_host && g_result_server_port > 0) {
+    if (g_result_server_host && g_result_server_port > 0 && !data->result_socket_disabled) {
         if (data->result_socket == INVALID_SOCKET) {
             data->result_socket = connect_to_result_server(g_result_server_host, g_result_server_port);
+            if (data->result_socket == INVALID_SOCKET) {
+                data->result_socket_disabled = true;
+            }
         }
 
         if (data->result_socket != INVALID_SOCKET) {
@@ -587,6 +746,10 @@ record_event(uint event_type, app_pc source, app_pc target)
 
     data->event_count++;
 
+    if (should_trace_interesting_pc(source)) {
+        flush_trace_buffer(drcontext, data);
+    }
+
     if (dr_atomic_add32_return_sum(&g_total_event_count, 1) >= DUMP_AFTER_EVENT_THRESHOLD) {
         g_dump_requested = true;
     }
@@ -632,6 +795,13 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
     if (!instr_is_app(inst)) {
         return DR_EMIT_DEFAULT;
     }
+
+    pc = instr_get_app_pc(inst);
+    if (!should_trace_interesting_pc(pc)) {
+        return DR_EMIT_DEFAULT;
+    }
+
+    maybe_log_sample_execution(pc);
 
     /* Handle anti-debug instructions before checking g_dump_requested */
     if (g_bypass_antidebug) {
@@ -691,9 +861,6 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
         return DR_EMIT_DEFAULT;
     }
 
-    pc = instr_get_app_pc(inst);
-    maybe_log_sample_execution(pc);
-
     if (drmgr_is_first_instr(drcontext, inst)) {
         dr_insert_clean_call(drcontext, bb, inst, (void *)record_event, false, 4,
                            OPND_CREATE_INT32(EVENT_BASIC_BLOCK),
@@ -714,34 +881,6 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
         dr_insert_mbr_instrumentation(drcontext, bb, inst, (void *)at_return,
                                      SPILL_SLOT_1);
     } else if (instr_is_cbr(inst)) {
-        app_pc fall_through = (app_pc)decode_next_pc(drcontext, pc);
-        app_pc target = opnd_get_pc(instr_get_target(inst));
-
-        instrlist_meta_preinsert(bb, inst,
-            XINST_CREATE_load_int(drcontext,
-                                 opnd_create_reg(DR_REG_XAX),
-                                 OPND_CREATE_INTPTR(pc)));
-        instrlist_meta_preinsert(bb, inst,
-            XINST_CREATE_load_int(drcontext,
-                                 opnd_create_reg(DR_REG_XCX),
-                                 OPND_CREATE_INTPTR(target)));
-        dr_insert_clean_call(drcontext, bb, inst, (void *)at_branch, false, 3,
-                           opnd_create_reg(DR_REG_XAX),
-                           opnd_create_reg(DR_REG_XCX),
-                           OPND_CREATE_INT32(1));
-
-        instrlist_meta_preinsert(bb, instr_get_next(inst),
-            XINST_CREATE_load_int(drcontext,
-                                 opnd_create_reg(DR_REG_XAX),
-                                 OPND_CREATE_INTPTR(pc)));
-        instrlist_meta_preinsert(bb, instr_get_next(inst),
-            XINST_CREATE_load_int(drcontext,
-                                 opnd_create_reg(DR_REG_XCX),
-                                 OPND_CREATE_INTPTR(fall_through)));
-        dr_insert_clean_call(drcontext, bb, instr_get_next(inst), (void *)at_branch, false, 3,
-                           opnd_create_reg(DR_REG_XAX),
-                           opnd_create_reg(DR_REG_XCX),
-                           OPND_CREATE_INT32(0));
     } else if (instr_is_ubr(inst) && opnd_is_pc(instr_get_target(inst))) {
         /* Direct unconditional branch - usually not interesting for CFG */
     } else if (instr_is_mbr(inst) && !instr_is_return(inst) && !instr_is_call(inst)) {
@@ -783,7 +922,7 @@ event_module_load(void *drcontext, const module_data_t *mod, bool loaded)
 
     if (!g_sample_module_seen) {
         const char *module_path = dr_module_preferred_name(mod);
-        if (module_path != NULL && string_contains_case_insensitive(module_path, ".exe")) {
+        if (is_probable_sample_module_name(module_path)) {
             g_sample_module_seen = true;
             g_sample_base = mod->start;
             g_sample_end = mod->end;
@@ -809,6 +948,7 @@ event_thread_init(void *drcontext)
     data->event_count = 0;
 #ifdef WINDOWS
     data->result_socket = INVALID_SOCKET;
+    data->result_socket_disabled = false;
 #endif
 
     drmgr_set_tls_field(drcontext, tls_idx, data);
@@ -1119,6 +1259,49 @@ wrap_NtQuerySystemInformation(void *wrapcxt, OUT void **user_data)
 }
 
 static void
+wrap_VirtualAlloc_post(void *wrapcxt, void *user_data)
+{
+    PVOID base = drwrap_get_retval(wrapcxt);
+    SIZE_T size = (SIZE_T)(ptr_uint_t)drwrap_get_arg(wrapcxt, 1);
+    ULONG protect = (ULONG)(ptr_uint_t)drwrap_get_arg(wrapcxt, 3);
+    write_memory_region_event("VirtualAlloc", base, size, protect, base != NULL);
+}
+
+static void
+wrap_VirtualProtect_post(void *wrapcxt, void *user_data)
+{
+    BOOL ret = (BOOL)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    PVOID base = drwrap_get_arg(wrapcxt, 0);
+    SIZE_T size = (SIZE_T)(ptr_uint_t)drwrap_get_arg(wrapcxt, 1);
+    ULONG protect = (ULONG)(ptr_uint_t)drwrap_get_arg(wrapcxt, 2);
+    write_memory_region_event("VirtualProtect", base, size, protect, ret);
+}
+
+static void
+wrap_NtAllocateVirtualMemory_post(void *wrapcxt, void *user_data)
+{
+    LONG status = (LONG)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    PVOID *base_ptr = (PVOID *)drwrap_get_arg(wrapcxt, 1);
+    SIZE_T *size_ptr = (SIZE_T *)drwrap_get_arg(wrapcxt, 3);
+    ULONG protect = (ULONG)(ptr_uint_t)drwrap_get_arg(wrapcxt, 5);
+    PVOID base = base_ptr ? *base_ptr : NULL;
+    SIZE_T size = size_ptr ? *size_ptr : 0;
+    write_memory_region_event("NtAllocateVirtualMemory", base, size, protect, status >= 0);
+}
+
+static void
+wrap_NtProtectVirtualMemory_post(void *wrapcxt, void *user_data)
+{
+    LONG status = (LONG)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    PVOID *base_ptr = (PVOID *)drwrap_get_arg(wrapcxt, 1);
+    SIZE_T *size_ptr = (SIZE_T *)drwrap_get_arg(wrapcxt, 2);
+    ULONG protect = (ULONG)(ptr_uint_t)drwrap_get_arg(wrapcxt, 3);
+    PVOID base = base_ptr ? *base_ptr : NULL;
+    SIZE_T size = size_ptr ? *size_ptr : 0;
+    write_memory_region_event("NtProtectVirtualMemory", base, size, protect, status >= 0);
+}
+
+static void
 wrap_OutputDebugStringA(void *wrapcxt, OUT void **user_data)
 {
     /* Just skip the call - don't actually output anything */
@@ -1139,7 +1322,8 @@ static void
 cache_drio_module_ranges(void)
 {
     const char *names[] = {"dynamorio.dll", "drwrap.dll", "drmgr.dll",
-                           "drutil.dll", "shrike_drcov_nudge.dll", NULL};
+                           "drutil.dll", "shrike_drcov_nudge.dll",
+                           "shrike_drcov_nudge_final.dll", NULL};
     int i;
     g_drio_range_count = 0;
     for (i = 0; names[i] != NULL && g_drio_range_count < 10; i++) {
@@ -1160,6 +1344,20 @@ is_drio_module_range(app_pc addr)
     for (i = 0; i < g_drio_range_count; i++) {
         if (addr >= g_drio_ranges[i][0] && addr < g_drio_ranges[i][1])
             return true;
+    }
+    return false;
+}
+
+static bool
+is_drio_module_handle(HMODULE module_handle)
+{
+    int i;
+
+    for (i = 0; i < g_drio_range_count; i++) {
+        if ((app_pc)module_handle >= g_drio_ranges[i][0] &&
+            (app_pc)module_handle < g_drio_ranges[i][1]) {
+            return true;
+        }
     }
     return false;
 }
@@ -1211,7 +1409,8 @@ static void
 erase_drio_pe_headers(void)
 {
     const char *names[] = {"dynamorio.dll", "drwrap.dll", "drmgr.dll",
-                           "drutil.dll", "shrike_drcov_nudge.dll", NULL};
+                           "drutil.dll", "shrike_drcov_nudge.dll",
+                           "shrike_drcov_nudge_final.dll", NULL};
     int i;
     char json_buf[256];
 
@@ -1347,6 +1546,7 @@ unlink_module_from_peb(void)
         L"drmgr.dll",
         L"drutil.dll",
         L"shrike_drcov_nudge.dll",
+        L"shrike_drcov_nudge_final.dll",
         NULL
     };
 
@@ -1402,18 +1602,315 @@ unlink_module_from_peb(void)
 }
 #endif
 
+/* ========== Module Enumeration API Hooks ========== */
+/* These hooks hide DynamoRIO modules from enumeration APIs to prevent detection */
+
+static bool
+is_drio_module_name_ascii(const char *name)
+{
+    if (name == NULL) return false;
+    /* Case-insensitive comparison */
+    const char *drio_names[] = {
+        "dynamorio.dll", "drwrap.dll", "drmgr.dll",
+        "drutil.dll", "shrike_drcov_nudge.dll", NULL
+    };
+    int i, j;
+    for (i = 0; drio_names[i] != NULL; i++) {
+        const char *dn = drio_names[i];
+        for (j = 0; name[j] != '\0' && dn[j] != '\0'; j++) {
+            char c1 = name[j], c2 = dn[j];
+            if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+            if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+            if (c1 != c2) break;
+        }
+        if (name[j] == '\0' && dn[j] == '\0') return true;
+    }
+    return is_probable_drio_module_name(name);
+}
+
+static bool
+is_drio_module_name_wide(const wchar_t *name)
+{
+    if (name == NULL) return false;
+    char ascii[256];
+    int i;
+    for (i = 0; i < 255 && name[i] != 0; i++) {
+        ascii[i] = (char)name[i];
+    }
+    ascii[i] = '\0';
+    return is_drio_module_name_ascii(ascii);
+}
+
+#ifdef WINDOWS
+/* MODULEENTRY32 structure - use explicit definition to avoid header dependency issues */
+typedef struct _MODULEENTRY32_HOOK {
+    DWORD dwSize;
+    DWORD th32ModuleID;
+    DWORD th32ProcessID;
+    DWORD GlblcntUsage;
+    DWORD ProccntUsage;
+    BYTE *modBaseAddr;
+    DWORD modBaseSize;
+    HMODULE hModule;
+    char szModule[256];
+    char szExePath[260];
+} MODULEENTRY32_HOOK;
+
+typedef struct _MODULEENTRY32W_HOOK {
+    DWORD dwSize;
+    DWORD th32ModuleID;
+    DWORD th32ProcessID;
+    DWORD GlblcntUsage;
+    DWORD ProccntUsage;
+    BYTE *modBaseAddr;
+    DWORD modBaseSize;
+    HMODULE hModule;
+    wchar_t szModule[256];
+    wchar_t szExePath[260];
+} MODULEENTRY32W_HOOK;
+#endif
+
+/* Hook Module32First/Next - skip DRIO modules by calling Next repeatedly */
+typedef BOOL (WINAPI *Module32Next_t)(HANDLE, void *);
+typedef BOOL (WINAPI *Module32NextW_t)(HANDLE, void *);
+static Module32Next_t g_Module32Next_real = NULL;
+static Module32NextW_t g_Module32NextW_real = NULL;
+
+static void
+wrap_Module32First_post(void *wrapcxt, void *user_data)
+{
+#ifdef WINDOWS
+    BOOL ret = (BOOL)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    if (!ret) return;
+
+    MODULEENTRY32_HOOK *me = (MODULEENTRY32_HOOK *)user_data;
+    if (me == NULL) return;
+
+    /* If current entry is DRIO module, advance to next non-DRIO */
+    while (ret && is_drio_module_name_ascii(me->szModule)) {
+        if (g_Module32Next_real) {
+            HANDLE hSnap = (HANDLE)drwrap_get_arg(wrapcxt, 0);
+            ret = g_Module32Next_real(hSnap, me);
+        } else {
+            break;
+        }
+    }
+    drwrap_set_retval(wrapcxt, (void *)(ptr_int_t)ret);
+#endif
+}
+
+static void
+wrap_Module32First_pre(void *wrapcxt, OUT void **user_data)
+{
+    *user_data = drwrap_get_arg(wrapcxt, 1);
+}
+
+static void
+wrap_Module32FirstW_post(void *wrapcxt, void *user_data)
+{
+#ifdef WINDOWS
+    BOOL ret = (BOOL)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    if (!ret) return;
+
+    MODULEENTRY32W_HOOK *me = (MODULEENTRY32W_HOOK *)user_data;
+    if (me == NULL) return;
+
+    while (ret && is_drio_module_name_wide(me->szModule)) {
+        if (g_Module32NextW_real) {
+            HANDLE hSnap = (HANDLE)drwrap_get_arg(wrapcxt, 0);
+            ret = g_Module32NextW_real(hSnap, me);
+        } else {
+            break;
+        }
+    }
+    drwrap_set_retval(wrapcxt, (void *)(ptr_int_t)ret);
+#endif
+}
+
+static void
+wrap_Module32Next_post(void *wrapcxt, void *user_data)
+{
+#ifdef WINDOWS
+    BOOL ret = (BOOL)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    if (!ret) return;
+
+    MODULEENTRY32_HOOK *me = (MODULEENTRY32_HOOK *)user_data;
+    if (me == NULL) return;
+
+    while (ret && is_drio_module_name_ascii(me->szModule)) {
+        if (g_Module32Next_real) {
+            HANDLE hSnap = (HANDLE)drwrap_get_arg(wrapcxt, 0);
+            ret = g_Module32Next_real(hSnap, me);
+        } else {
+            break;
+        }
+    }
+    drwrap_set_retval(wrapcxt, (void *)(ptr_int_t)ret);
+#endif
+}
+
+static void
+wrap_Module32NextW_post(void *wrapcxt, void *user_data)
+{
+#ifdef WINDOWS
+    BOOL ret = (BOOL)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    if (!ret) return;
+
+    MODULEENTRY32W_HOOK *me = (MODULEENTRY32W_HOOK *)user_data;
+    if (me == NULL) return;
+
+    while (ret && is_drio_module_name_wide(me->szModule)) {
+        if (g_Module32NextW_real) {
+            HANDLE hSnap = (HANDLE)drwrap_get_arg(wrapcxt, 0);
+            ret = g_Module32NextW_real(hSnap, me);
+        } else {
+            break;
+        }
+    }
+    drwrap_set_retval(wrapcxt, (void *)(ptr_int_t)ret);
+#endif
+}
+
+static void
+wrap_Module32Next_pre(void *wrapcxt, OUT void **user_data)
+{
+    *user_data = drwrap_get_arg(wrapcxt, 1);
+}
+
+/* Hook GetModuleHandle - return NULL for DRIO modules */
+static void
+wrap_GetModuleHandleA_pre(void *wrapcxt, OUT void **user_data)
+{
+    const char *name = (const char *)drwrap_get_arg(wrapcxt, 0);
+    if (name != NULL && is_drio_module_name_ascii(name)) {
+        drwrap_skip_call(wrapcxt, NULL, 0);
+    }
+}
+
+static void
+wrap_GetModuleHandleW_pre(void *wrapcxt, OUT void **user_data)
+{
+    const wchar_t *name = (const wchar_t *)drwrap_get_arg(wrapcxt, 0);
+    if (name != NULL && is_drio_module_name_wide(name)) {
+        drwrap_skip_call(wrapcxt, NULL, 0);
+    }
+}
+
+static void
+wrap_GetModuleFileNameA_post(void *wrapcxt, void *user_data)
+{
+    HMODULE module_handle = (HMODULE)drwrap_get_arg(wrapcxt, 0);
+    if (module_handle != NULL && is_drio_module_handle(module_handle)) {
+        drwrap_set_retval(wrapcxt, (void *)0);
+    }
+}
+
+static void
+wrap_GetModuleFileNameW_post(void *wrapcxt, void *user_data)
+{
+    HMODULE module_handle = (HMODULE)drwrap_get_arg(wrapcxt, 0);
+    if (module_handle != NULL && is_drio_module_handle(module_handle)) {
+        drwrap_set_retval(wrapcxt, (void *)0);
+    }
+}
+
+static void
+wrap_GetVersionExA_post(void *wrapcxt, void *user_data)
+{
+    OSVERSIONINFOA *version_info = (OSVERSIONINFOA *)drwrap_get_arg(wrapcxt, 0);
+    if (version_info != NULL) {
+        version_info->dwMajorVersion = 10;
+        version_info->dwMinorVersion = 0;
+        version_info->dwBuildNumber = 19045;
+        version_info->dwPlatformId = VER_PLATFORM_WIN32_NT;
+        if (version_info->szCSDVersion[0] != '\0') {
+            version_info->szCSDVersion[0] = '\0';
+        }
+        drwrap_set_retval(wrapcxt, (void *)1);
+    }
+}
+
+static void
+wrap_GetVersionExW_post(void *wrapcxt, void *user_data)
+{
+    OSVERSIONINFOW *version_info = (OSVERSIONINFOW *)drwrap_get_arg(wrapcxt, 0);
+    if (version_info != NULL) {
+        version_info->dwMajorVersion = 10;
+        version_info->dwMinorVersion = 0;
+        version_info->dwBuildNumber = 19045;
+        version_info->dwPlatformId = VER_PLATFORM_WIN32_NT;
+        if (version_info->szCSDVersion[0] != L'\0') {
+            version_info->szCSDVersion[0] = L'\0';
+        }
+        drwrap_set_retval(wrapcxt, (void *)1);
+    }
+}
+
+/* Hook EnumProcessModules - filter out DRIO modules from results */
+static void
+wrap_EnumProcessModules_post(void *wrapcxt, void *user_data)
+{
+#ifdef WINDOWS
+    BOOL ret = (BOOL)(ptr_int_t)drwrap_get_retval(wrapcxt);
+    if (!ret) return;
+
+    HMODULE *modules = (HMODULE *)drwrap_get_arg(wrapcxt, 1);
+    DWORD *pcbNeeded = (DWORD *)drwrap_get_arg(wrapcxt, 3);
+    if (modules == NULL || pcbNeeded == NULL) return;
+
+    DWORD cb = (DWORD)(ptr_uint_t)drwrap_get_arg(wrapcxt, 2);
+    DWORD count = cb / sizeof(HMODULE);
+    DWORD actual_count = *pcbNeeded / sizeof(HMODULE);
+    if (actual_count > count) actual_count = count;
+
+    /* Filter out DRIO module handles */
+    DWORD write_idx = 0;
+    DWORD i;
+    for (i = 0; i < actual_count; i++) {
+        bool is_drio = false;
+        int j;
+        for (j = 0; j < g_drio_range_count; j++) {
+            if ((app_pc)modules[i] >= g_drio_ranges[j][0] &&
+                (app_pc)modules[i] < g_drio_ranges[j][1]) {
+                is_drio = true;
+                break;
+            }
+        }
+        if (!is_drio) {
+            modules[write_idx++] = modules[i];
+        }
+    }
+
+    /* Zero out removed entries and update count */
+    for (i = write_idx; i < actual_count; i++) {
+        modules[i] = NULL;
+    }
+    *pcbNeeded = write_idx * sizeof(HMODULE);
+#endif
+}
+
+static void
+wrap_K32EnumProcessModules_post(void *wrapcxt, void *user_data)
+{
+    wrap_EnumProcessModules_post(wrapcxt, user_data);
+}
+
 static void
 setup_antidebug_bypass(void)
 {
     module_data_t *kernel32, *ntdll;
     app_pc IsDebuggerPresent_addr, CheckRemoteDebuggerPresent_addr;
+    app_pc VirtualAlloc_addr, VirtualProtect_addr;
     app_pc NtQueryInformationProcess_addr, NtSetInformationThread_addr;
+    app_pc NtAllocateVirtualMemory_addr, NtProtectVirtualMemory_addr;
     app_pc GetTickCount_addr, QueryPerformanceCounter_addr;
     app_pc RaiseException_addr, SetUnhandledExceptionFilter_addr;
     app_pc RtlDispatchException_addr, KiUserExceptionDispatcher_addr;
     app_pc RtlRaiseException_addr, AddVectoredExceptionHandler_addr;
     app_pc GetThreadContext_addr, NtQuerySystemInformation_addr;
     app_pc OutputDebugStringA_addr, OutputDebugStringW_addr;
+    app_pc GetModuleFileNameA_addr, GetModuleFileNameW_addr;
+    app_pc GetVersionExA_addr, GetVersionExW_addr;
     write_probe_event_json("{\"event\":\"antidebug_setup\",\"status\":\"start\"}");
 
     cache_drio_module_ranges();
@@ -1430,6 +1927,18 @@ setup_antidebug_bypass(void)
         if (CheckRemoteDebuggerPresent_addr != NULL) {
             drwrap_wrap(CheckRemoteDebuggerPresent_addr, wrap_CheckRemoteDebuggerPresent, NULL);
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped CheckRemoteDebuggerPresent\n");
+        }
+
+        VirtualAlloc_addr = (app_pc)dr_get_proc_address(kernel32->handle, "VirtualAlloc");
+        if (VirtualAlloc_addr != NULL) {
+            drwrap_wrap(VirtualAlloc_addr, NULL, wrap_VirtualAlloc_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped VirtualAlloc\n");
+        }
+
+        VirtualProtect_addr = (app_pc)dr_get_proc_address(kernel32->handle, "VirtualProtect");
+        if (VirtualProtect_addr != NULL) {
+            drwrap_wrap(VirtualProtect_addr, NULL, wrap_VirtualProtect_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped VirtualProtect\n");
         }
 
         GetTickCount_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetTickCount");
@@ -1462,19 +1971,19 @@ setup_antidebug_bypass(void)
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetSystemTimeAsFileTime\n");
         }
 
-        RaiseException_addr = (app_pc)dr_get_proc_address(kernel32->handle, "RaiseException");
+        RaiseException_addr = NULL;
         if (RaiseException_addr != NULL) {
             drwrap_wrap(RaiseException_addr, wrap_RaiseException, NULL);
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped RaiseException\n");
         }
 
-        SetUnhandledExceptionFilter_addr = (app_pc)dr_get_proc_address(kernel32->handle, "SetUnhandledExceptionFilter");
+        SetUnhandledExceptionFilter_addr = NULL;
         if (SetUnhandledExceptionFilter_addr != NULL) {
             drwrap_wrap(SetUnhandledExceptionFilter_addr, wrap_SetUnhandledExceptionFilter, NULL);
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped SetUnhandledExceptionFilter\n");
         }
 
-        GetThreadContext_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetThreadContext");
+        GetThreadContext_addr = NULL;
         if (GetThreadContext_addr != NULL) {
             drwrap_wrap(GetThreadContext_addr, NULL, wrap_GetThreadContext);
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetThreadContext\n");
@@ -1492,7 +2001,101 @@ setup_antidebug_bypass(void)
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped OutputDebugStringW\n");
         }
 
+        GetModuleFileNameA_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetModuleFileNameA");
+        if (GetModuleFileNameA_addr != NULL) {
+            drwrap_wrap(GetModuleFileNameA_addr, NULL, wrap_GetModuleFileNameA_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetModuleFileNameA\n");
+        }
+        GetModuleFileNameW_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetModuleFileNameW");
+        if (GetModuleFileNameW_addr != NULL) {
+            drwrap_wrap(GetModuleFileNameW_addr, NULL, wrap_GetModuleFileNameW_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetModuleFileNameW\n");
+        }
+
+        GetVersionExA_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetVersionExA");
+        if (GetVersionExA_addr != NULL) {
+            drwrap_wrap(GetVersionExA_addr, NULL, wrap_GetVersionExA_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetVersionExA\n");
+        }
+        GetVersionExW_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetVersionExW");
+        if (GetVersionExW_addr != NULL) {
+            drwrap_wrap(GetVersionExW_addr, NULL, wrap_GetVersionExW_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetVersionExW\n");
+        }
+
+        /* ===== Module Enumeration API hooks (anti-detection) ===== */
+        app_pc Module32First_addr = (app_pc)dr_get_proc_address(kernel32->handle, "Module32First");
+        app_pc Module32Next_addr = (app_pc)dr_get_proc_address(kernel32->handle, "Module32Next");
+        app_pc Module32FirstW_addr = (app_pc)dr_get_proc_address(kernel32->handle, "Module32FirstW");
+        app_pc Module32NextW_addr = (app_pc)dr_get_proc_address(kernel32->handle, "Module32NextW");
+
+        if (Module32Next_addr != NULL) {
+            g_Module32Next_real = (Module32Next_t)Module32Next_addr;
+            drwrap_wrap(Module32Next_addr, wrap_Module32Next_pre, wrap_Module32Next_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped Module32Next\n");
+        }
+        if (Module32NextW_addr != NULL) {
+            g_Module32NextW_real = (Module32NextW_t)Module32NextW_addr;
+            drwrap_wrap(Module32NextW_addr, wrap_Module32Next_pre, wrap_Module32NextW_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped Module32NextW\n");
+        }
+        if (Module32First_addr != NULL) {
+            drwrap_wrap(Module32First_addr, wrap_Module32First_pre, wrap_Module32First_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped Module32First\n");
+        }
+        if (Module32FirstW_addr != NULL) {
+            drwrap_wrap(Module32FirstW_addr, wrap_Module32First_pre, wrap_Module32FirstW_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped Module32FirstW\n");
+        }
+
+        app_pc CreateToolhelp32Snapshot_addr = (app_pc)dr_get_proc_address(kernel32->handle, "CreateToolhelp32Snapshot");
+        if (CreateToolhelp32Snapshot_addr != NULL) {
+            dr_fprintf(STDERR, "shrike_cfg_tracer: CreateToolhelp32Snapshot available\n");
+        }
+
+        app_pc GetModuleHandleA_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetModuleHandleA");
+        app_pc GetModuleHandleW_addr = (app_pc)dr_get_proc_address(kernel32->handle, "GetModuleHandleW");
+        if (GetModuleHandleA_addr != NULL) {
+            drwrap_wrap(GetModuleHandleA_addr, wrap_GetModuleHandleA_pre, NULL);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetModuleHandleA\n");
+        }
+        if (GetModuleHandleW_addr != NULL) {
+            drwrap_wrap(GetModuleHandleW_addr, wrap_GetModuleHandleW_pre, NULL);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped GetModuleHandleW\n");
+        }
+
         dr_free_module_data(kernel32);
+    }
+
+    /* Hook EnumProcessModules in psapi.dll or kernelbase.dll */
+    {
+        module_data_t *psapi = dr_lookup_module_by_name("psapi.dll");
+        if (psapi == NULL) {
+            psapi = dr_lookup_module_by_name("kernelbase.dll");
+        }
+        if (psapi != NULL) {
+            app_pc EnumProcessModules_addr = (app_pc)dr_get_proc_address(psapi->handle, "EnumProcessModules");
+            if (EnumProcessModules_addr != NULL) {
+                drwrap_wrap(EnumProcessModules_addr, NULL, wrap_EnumProcessModules_post);
+                dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped EnumProcessModules\n");
+            }
+            app_pc EnumProcessModulesEx_addr = (app_pc)dr_get_proc_address(psapi->handle, "EnumProcessModulesEx");
+            if (EnumProcessModulesEx_addr != NULL) {
+                drwrap_wrap(EnumProcessModulesEx_addr, NULL, wrap_EnumProcessModules_post);
+                dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped EnumProcessModulesEx\n");
+            }
+            app_pc K32EnumProcessModules_addr = (app_pc)dr_get_proc_address(psapi->handle, "K32EnumProcessModules");
+            if (K32EnumProcessModules_addr != NULL) {
+                drwrap_wrap(K32EnumProcessModules_addr, NULL, wrap_K32EnumProcessModules_post);
+                dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped K32EnumProcessModules\n");
+            }
+            app_pc K32EnumProcessModulesEx_addr = (app_pc)dr_get_proc_address(psapi->handle, "K32EnumProcessModulesEx");
+            if (K32EnumProcessModulesEx_addr != NULL) {
+                drwrap_wrap(K32EnumProcessModulesEx_addr, NULL, wrap_K32EnumProcessModules_post);
+                dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped K32EnumProcessModulesEx\n");
+            }
+            dr_free_module_data(psapi);
+        }
     }
 
     ntdll = dr_lookup_module_by_name("ntdll.dll");
@@ -1509,26 +2112,38 @@ setup_antidebug_bypass(void)
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped NtSetInformationThread\n");
         }
 
-        RtlDispatchException_addr = (app_pc)dr_get_proc_address(ntdll->handle, "RtlDispatchException");
+        NtAllocateVirtualMemory_addr = (app_pc)dr_get_proc_address(ntdll->handle, "NtAllocateVirtualMemory");
+        if (NtAllocateVirtualMemory_addr != NULL) {
+            drwrap_wrap(NtAllocateVirtualMemory_addr, NULL, wrap_NtAllocateVirtualMemory_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped NtAllocateVirtualMemory\n");
+        }
+
+        NtProtectVirtualMemory_addr = (app_pc)dr_get_proc_address(ntdll->handle, "NtProtectVirtualMemory");
+        if (NtProtectVirtualMemory_addr != NULL) {
+            drwrap_wrap(NtProtectVirtualMemory_addr, NULL, wrap_NtProtectVirtualMemory_post);
+            dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped NtProtectVirtualMemory\n");
+        }
+
+        RtlDispatchException_addr = NULL;
         if (RtlDispatchException_addr != NULL) {
             drwrap_wrap(RtlDispatchException_addr, wrap_RtlDispatchException, NULL);
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped RtlDispatchException\n");
         }
 
-        KiUserExceptionDispatcher_addr = (app_pc)dr_get_proc_address(ntdll->handle, "KiUserExceptionDispatcher");
+        KiUserExceptionDispatcher_addr = NULL;
         if (KiUserExceptionDispatcher_addr != NULL) {
             drwrap_wrap(KiUserExceptionDispatcher_addr, wrap_KiUserExceptionDispatcher, NULL);
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped KiUserExceptionDispatcher\n");
         }
 
-        RtlRaiseException_addr = (app_pc)dr_get_proc_address(ntdll->handle, "RtlRaiseException");
+        RtlRaiseException_addr = NULL;
         if (RtlRaiseException_addr != NULL) {
             drwrap_wrap(RtlRaiseException_addr, wrap_RtlRaiseException, NULL);
             dr_fprintf(STDERR, "shrike_cfg_tracer: wrapped RtlRaiseException\n");
         }
 
-        AddVectoredExceptionHandler_addr = (app_pc)dr_get_proc_address(ntdll->handle, "RtlAddVectoredExceptionHandler");
-        if (AddVectoredExceptionHandler_addr == NULL) {
+        AddVectoredExceptionHandler_addr = NULL;
+        if (false && AddVectoredExceptionHandler_addr == NULL) {
             AddVectoredExceptionHandler_addr = (app_pc)dr_get_proc_address(ntdll->handle, "AddVectoredExceptionHandler");
         }
         if (AddVectoredExceptionHandler_addr != NULL) {
@@ -1552,9 +2167,13 @@ setup_antidebug_bypass(void)
     patch_peb_fields();
     dr_fprintf(STDERR, "shrike_cfg_tracer: PEB fields patched\n");
 
-    /* Unlink DynamoRIO modules from PEB to hide from module enumeration */
-    unlink_module_from_peb();
-    dr_fprintf(STDERR, "shrike_cfg_tracer: PEB unlinking completed\n");
+    /* Unlinking DRIO modules from the PEB is unstable on this VM. */
+    if (g_enable_peb_unlinking) {
+        unlink_module_from_peb();
+        dr_fprintf(STDERR, "shrike_cfg_tracer: PEB unlinking completed\n");
+    } else {
+        dr_fprintf(STDERR, "shrike_cfg_tracer: PEB unlinking disabled\n");
+    }
 #endif
 }
 
@@ -1567,6 +2186,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     g_logprefix = get_client_option(argc, argv, "-logprefix");
     g_dump_text = has_client_option(argc, argv, "-dump_text");
     g_bypass_antidebug = has_client_option(argc, argv, "-bypass_antidebug");
+    g_enable_peb_unlinking = has_client_option(argc, argv, "-enable_peb_unlinking");
     g_result_server_host = get_client_option(argc, argv, "-result_server_host");
 
     {
@@ -1637,6 +2257,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     g_sample_base = NULL;
     g_sample_end = NULL;
     g_sample_path[0] = '\0';
+    g_dynamic_exec_region_count = 0;
 
     dr_fprintf(STDERR, "shrike_cfg_tracer: initialized build_id=%s logdir=%s logprefix=%s bypass_antidebug=%d pid=%d\n",
                BUILD_ID, g_logdir ? g_logdir : ".", g_logprefix ? g_logprefix : "trace", g_bypass_antidebug, dr_get_process_id());

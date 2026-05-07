@@ -85,11 +85,67 @@ The sandbox implements several anti-analysis evasion techniques:
 5. **Boot stabilization delay**: Allows system to settle before sample execution
 6. **Sysmon telemetry**: Captures behavioral indicators even if sample detects sandbox
 
-### Known Limitations
+### Known Limitations and Mitigations
 
-- **ISO media loading issue**: Current implementation has issues with ISO recognition in Gen1 VMs after snapshot restore. Media may not be loaded (`MediaLoaded = False`).
-- **DynamoRIO detection**: Advanced malware may detect DynamoRIO instrumentation.
-- **Hyper-V artifacts**: VM-aware malware can detect Hyper-V environment.
+#### 1. ISO Media Loading (RESOLVED)
+- **Issue**: Gen1 VMs had issues with ISO recognition after snapshot restore
+- **Status**: ✅ Fixed - ISO media loads correctly and is accessible in guest
+- **Solution**: Proper DVD drive configuration and media refresh via PowerShell Direct
+
+#### 2. DynamoRIO Module Detection (PARTIALLY MITIGATED)
+- **Issue**: Advanced malware detects DynamoRIO by enumerating loaded modules
+- **Evidence**: Trace data shows DynamoRIO DLLs visible in module enumeration:
+  - `dynamorio.dll`, `drmgr.dll`, `drwrap.dll`, `drutil.dll`, `shrike_drcov_nudge.dll`
+- **Impact**: Some samples may reduce behavior or crash when software instrumentation is visible.
+- **Diagnosis**:
+  - DynamoRIO control-flow tracing works and captures sample-module execution.
+  - PEB BeingDebugged flag patching is active.
+  - API hooking is active for anti-debug and module-enumeration APIs.
+  - PEB unlinking remains disabled because it caused VM blue screens.
+  - DynamoRIO/private extension DLLs can still be observed by sufficiently deep checks.
+- **Root Cause**: DynamoRIO uses private module loading that bypasses standard Windows loader, so modules don't appear in PEB `InLoadOrderModuleList`. PEB unlinking cannot hide what isn't there.
+- **Attempted Solutions**:
+  1. PEB Module Unlinking - implemented, then disabled for stability.
+  2. API Hooking - implemented for module enumeration and common anti-debug APIs.
+  3. Memory-protection hooks - implemented for `VirtualAlloc`, `VirtualProtect`, `NtAllocateVirtualMemory`, and `NtProtectVirtualMemory`.
+- **Current Status**: **STABLE (PEB unlinking disabled)** - deep DRIO runs now reach sample code and ransomware behavior.
+- **Recommendation**: Keep DRIO for repeatable software CFG extraction; consider Intel PT for lower-observable tracing when evasion fidelity matters more than instrumentation detail.
+
+#### 3. Current CFG Result (VALIDATED 2026-05-07)
+- **Validated run**: `reports/drio_extended_8c716101_20260507_091234`
+- **Profile**: `sandbox/profiles/deep_cfg_drio_extended.json`
+- **Sample**: `8C716101E118AC65D7BDB900E0100D012256ABB1D7CDF64830E5943A795CCCE2`
+- **CFG Evidence**:
+  - `trace.status = control_flow_trace`
+  - `event_count = 98418`
+  - `sample_basic_block_count = 724`
+  - `edge_count = 1197`
+  - `call_count = 2034`
+  - `ordered_block_sample_count = 44317`
+  - sample module loaded at `0x7c0000`
+- **Behavior Evidence**:
+  - Ransom note landed as `xb7n5-readme.txt`.
+  - Multiple sandbox artifacts were renamed/encrypted with the `.xb7n5` extension, including `sample_metadata.json.xb7n5`, `task_profile.json.xb7n5`, and `process_snapshot_pre.csv.xb7n5`.
+  - Sysmon captured sample-origin DNS activity and file creation activity.
+- **CFG Interpretation**:
+  - The trace is no longer limited to system DLLs; CFG events are dominated by the sample module.
+  - Hot blocks around runtime addresses `0x820120` and `0x8201a8` map to static RVAs near `0x60120` and `0x601a8`, a tight byte-processing loop consistent with encrypted/decrypted buffer transformation.
+  - External indirect calls show file-enumeration related KERNEL32 targets near `FindFirstFileW` and `FindClose`, but API names are not yet recorded directly in the CFG.
+- **Current Gap**:
+  - The CFG currently records target addresses and modules, not resolved API names. Add file-API hooks or export-name resolution for `CreateFile*`, `ReadFile`, `WriteFile`, `MoveFile*`, `DeleteFile*`, `FindFirstFile*`, `FindNextFile*`, and `FindClose` if exact file-operation attribution is needed.
+
+#### 4. WSL / PowerShell Interop Limitation (WORKAROUND AVAILABLE)
+- **Issue**: launching Windows executables from nested WSL child processes can fail with `UtilBindVsockAnyPort: socket failed 1`.
+- **Observed Pattern**:
+  - top-level `powershell.exe -File ...` calls from the shell work.
+  - Python `subprocess.run(["powershell.exe", ...])` from WSL fails on this host.
+- **Impact**: `sandbox/scripts/analyze_sample.py` may fail because it invokes Windows PowerShell from a Python child process.
+- **Workaround**: use the top-level wrapper `windows_host/powershell/12_run_sandbox_wrapped.ps1`, which keeps Windows orchestration inside a single PowerShell process and only calls WSL for ISO build/report parsing.
+
+#### 5. Hyper-V Detection
+- **Issue**: VM-aware malware can detect Hyper-V environment
+- **Mitigation**: Minimal VM fingerprints, but hardware-level detection remains possible
+- **Future**: Consider Intel PT for hardware-level tracing (no software artifacts)
 
 ## Repository Layout
 
@@ -106,6 +162,7 @@ The sandbox implements several anti-analysis evasion techniques:
    - `powershell/04_invoke_offline_task.ps1` - Main VM orchestration script
    - `powershell/06_install_guest_runtime.ps1` - Deploys runtime to guest
    - `powershell/07_refresh_snapshots.ps1` - Rebuilds analysis snapshots
+   - `powershell/12_run_sandbox_wrapped.ps1` - Top-level PowerShell wrapper for hosts where WSL Python cannot launch Windows executables reliably
    - `drio_client/` - DynamoRIO client DLL source code
 
 3. `guest/`
@@ -216,6 +273,17 @@ python sandbox/scripts/analyze_sample.py "samples/your_sample.exe" \
   --task-profile sandbox/profiles/deep_cfg_drio.json
 ```
 
+On hosts affected by the WSL/Python interop limitation, use the top-level PowerShell wrapper instead:
+
+```bash
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File 'D:\project\ransomware\method12-dev\windows_host\powershell\12_run_sandbox_wrapped.ps1' \
+  -SamplePath 'samples\8c716101e118ac65d7bdb900e0100d012256abb1d7cdf64830e5943a795ccce2' \
+  -TaskProfile 'sandbox\profiles\deep_cfg_drio_extended.json' \
+  -ReportId 'drio_extended_8c716101_manual' \
+  -TimeoutSeconds 600
+```
+
 The parsed report is written under `reports/<sample_hash>_<timestamp>/`.
 
 ### 5. Inspect results
@@ -245,6 +313,14 @@ python sandbox/scripts/analyze_sample.py <sample_path> \
 # Analyze with custom timeout
 python sandbox/scripts/analyze_sample.py <sample_path> \
   --timeout-seconds 300
+
+# Workaround wrapper for WSL/Python interop failures
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File 'D:\project\ransomware\method12-dev\windows_host\powershell\12_run_sandbox_wrapped.ps1' \
+  -SamplePath '<sample_path>' \
+  -TaskProfile 'sandbox\profiles\deep_cfg_drio_extended.json' \
+  -ReportId '<report_id>' \
+  -TimeoutSeconds 600
 ```
 
 ### Guest Runtime Management
@@ -312,6 +388,23 @@ python sandbox/scripts/install_drio_runtime.py
 1. Check `windows_host/logs/04_invoke_offline_task_*.log`
 2. Boot maintenance VM and check `C:\Sandbox\output\runner.log`
 3. Verify scheduled task: `Get-ScheduledTask -TaskName SandboxRunTask`
+
+### WSL child process cannot launch PowerShell
+**Symptom**: `analyze_sample.py` fails before VM orchestration with:
+
+```text
+UtilBindVsockAnyPort: socket failed 1
+```
+
+**Cause**: WSL interop works for top-level `powershell.exe` calls, but fails when Python or another WSL child process launches Windows executables.
+
+**Workaround**: run the top-level wrapper:
+
+```bash
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File 'D:\project\ransomware\method12-dev\windows_host\powershell\12_run_sandbox_wrapped.ps1' \
+  -ReportId 'drio_extended_8c716101_manual'
+```
 
 ## Scope
 

@@ -202,6 +202,24 @@ function Export-SnapshotBundle {
     Write-RunnerLog ("exported {0} snapshot bundle" -f $Prefix)
 }
 
+function Publish-StagingArtifacts {
+    param(
+        [string]$StagingDir,
+        [string]$ArtifactDir,
+        [string]$Reason
+    )
+
+    if (-not (Test-Path $StagingDir)) {
+        Write-RunnerLog ("staging publish skipped ({0}): staging directory missing" -f $Reason)
+        return
+    }
+
+    New-Item -ItemType Directory -Force $ArtifactDir | Out-Null
+    Write-RunnerLog ("copying staging to artifact disk ({0})" -f $Reason)
+    Get-ChildItem -Path $StagingDir -Force -ErrorAction SilentlyContinue |
+        Copy-Item -Destination $ArtifactDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Get-SysmonEventObject {
     param([System.Diagnostics.Eventing.Reader.EventRecord]$Event)
 
@@ -659,7 +677,11 @@ try {
     $sampleDir = Join-Path $sampleDrive "sample"
     $artifactDir = Join-Path $artifactDrive "artifact"
     $stagingDir = Join-Path $localOutputRoot "staging"
+    $drioLogDirRoot = Join-Path $localOutputRoot "drio_logs"
     $localInput = "C:\Sandbox\input"
+
+    Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $drioLogDirRoot -Recurse -Force -ErrorAction SilentlyContinue
 
     New-Item -ItemType Directory -Force $localInput | Out-Null
     New-Item -ItemType Directory -Force $artifactDir | Out-Null
@@ -684,7 +706,7 @@ try {
     $traceModeName = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_mode" -Default "none"
 
     if ($traceModeName -eq "dynamic_cfg" -and $traceBackendName -eq "drio") {
-        $drioLogDir = Join-Path $localOutputRoot "drio_logs"
+        $drioLogDir = $drioLogDirRoot
         New-Item -ItemType Directory -Force $drioLogDir | Out-Null
 
         $is32bit = $false
@@ -712,14 +734,23 @@ try {
                 if ($prop -and $prop.Value -eq $true) { $bypassAntidebug = $true }
             }
 
+            $launchPath = $sample.FullName
+            if (-not $sample.Extension) {
+                $launchPath = Join-Path $sample.DirectoryName ("{0}.exe" -f $sample.Name)
+                Copy-Item -Path $sample.FullName -Destination $launchPath -Force
+                Write-RunnerLog ("created .exe copy for extensionless DRIO sample: {0}" -f $launchPath)
+            }
+
             $drrunArgs = @("-c", $clientDll, "-logdir", $drioLogDir, "-result_server_host", "192.168.100.1", "-result_server_port", "2042")
             if ($bypassAntidebug) {
                 $drrunArgs += "-bypass_antidebug"
             }
-            $drrunArgs += @("--", $sample.FullName)
+            $drrunArgs += @("--", $launchPath)
 
+            $drrunStdoutPath = Join-Path $stagingDir "drrun_stdout.txt"
+            $drrunStderrPath = Join-Path $stagingDir "drrun_stderr.txt"
             Write-RunnerLog ("launching via drrun: {0} {1}" -f $drrunExe, ($drrunArgs -join " "))
-            $proc = Start-Process -FilePath $drrunExe -ArgumentList $drrunArgs -PassThru
+            $proc = Start-Process -FilePath $drrunExe -ArgumentList $drrunArgs -RedirectStandardOutput $drrunStdoutPath -RedirectStandardError $drrunStderrPath -PassThru
         } else {
             Write-RunnerLog ("drrun or client DLL not found (drrun={0} client={1}); launching sample directly" -f $drrunExe, $clientDll)
             $launchPath = $sample.FullName
@@ -772,6 +803,8 @@ try {
 
     if ($traceBackendName -ne "drio") {
         Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+        Copy-Item $runnerLog -Destination (Join-Path $stagingDir "runner.log") -Force
+        Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "after trace export"
     }
 
     Start-Sleep -Seconds $executionWindowSeconds
@@ -795,6 +828,8 @@ try {
 
     if ($traceBackendName -eq "drio") {
         Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+        Copy-Item $runnerLog -Destination (Join-Path $stagingDir "runner.log") -Force
+        Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "after trace export"
     }
 
     Export-SnapshotBundle -Prefix "post" -ArtifactDir $stagingDir
@@ -877,8 +912,7 @@ try {
 
     Copy-Item $runnerLog -Destination (Join-Path $stagingDir "runner.log") -Force
 
-    Write-RunnerLog "copying staging to artifact disk"
-    Get-ChildItem -Path $stagingDir -Force -ErrorAction SilentlyContinue | Copy-Item -Destination $artifactDir -Recurse -Force -ErrorAction SilentlyContinue
+    Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "final"
 
     Stop-Computer -Force
 } catch {

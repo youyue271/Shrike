@@ -14,10 +14,30 @@ $ErrorActionPreference = "Stop"
 $request = Get-Content -Path $RequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $message = "DRIO backend parsed control-flow trace events."
 
+function New-ObjectList {
+    return New-Object System.Collections.Generic.List[object]
+}
+
+function Write-EventsNdjson {
+    param(
+        [array]$Events,
+        [string]$Path
+    )
+
+    $writer = [System.IO.StreamWriter]::new($Path, $false, [System.Text.Encoding]::UTF8)
+    try {
+        foreach ($event in $Events) {
+            $writer.WriteLine(($event | ConvertTo-Json -Compress -Depth 8))
+        }
+    } finally {
+        $writer.Dispose()
+    }
+}
+
 function Parse-NdjsonTraceLog {
     param([string]$Path)
 
-    $events = @()
+    $events = New-ObjectList
     foreach ($line in Get-Content -Path $Path -Encoding UTF8) {
         $trimmedLine = $line.Trim()
         if (-not $trimmedLine) {
@@ -25,12 +45,12 @@ function Parse-NdjsonTraceLog {
         }
         try {
             $event = $trimmedLine | ConvertFrom-Json
-            $events += $event
+            [void]$events.Add($event)
         } catch {
             continue
         }
     }
-    return $events
+    return $events.ToArray()
 }
 
 function Get-LoadedModuleForAddress {
@@ -87,31 +107,30 @@ function Convert-NdjsonEventsToStandardFormat {
         $Request
     )
 
-    $standardEvents = @(
-        [PSCustomObject][ordered]@{
-            event = "trace_status"
-            trace_mode = $Request.trace_mode
-            trace_backend = "drio"
-            status = "control_flow_trace"
-            message = $message
-            sample_name = $Request.sample_name
-            launched_pid = $Request.launched_pid
-            started_at = $Request.started_at
-            ended_at = $Request.ended_at
-        },
-        [PSCustomObject][ordered]@{
-            event = "trace_window"
-            sample_name = $Request.sample_name
-            launched_pid = $Request.launched_pid
-            started_at = $Request.started_at
-            ended_at = $Request.ended_at
-        }
-    )
+    $standardEvents = New-ObjectList
+    [void]$standardEvents.Add([PSCustomObject][ordered]@{
+        event = "trace_status"
+        trace_mode = $Request.trace_mode
+        trace_backend = "drio"
+        status = "control_flow_trace"
+        message = $message
+        sample_name = $Request.sample_name
+        launched_pid = $Request.launched_pid
+        started_at = $Request.started_at
+        ended_at = $Request.ended_at
+    })
+    [void]$standardEvents.Add([PSCustomObject][ordered]@{
+        event = "trace_window"
+        sample_name = $Request.sample_name
+        launched_pid = $Request.launched_pid
+        started_at = $Request.started_at
+        ended_at = $Request.ended_at
+    })
 
     $modulesSeen = @{}
     $basicBlocksSeen = @{}
     $previousBlockByThread = @{}
-    $modulesLoaded = @()
+    $modulesLoaded = New-ObjectList
 
     foreach ($rawEvent in $RawEvents) {
         $eventType = [string]$rawEvent.event
@@ -120,14 +139,14 @@ function Convert-NdjsonEventsToStandardFormat {
         $target = $rawEvent.target
 
         if ($eventType -eq "client_metadata") {
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "client_metadata"
                 build_id = $rawEvent.build_id
                 bypass_antidebug = $rawEvent.bypass_antidebug
                 pid = $rawEvent.pid
                 logdir = $rawEvent.logdir
                 logprefix = $rawEvent.logprefix
-            }
+            })
             continue
         }
 
@@ -142,22 +161,22 @@ function Convert-NdjsonEventsToStandardFormat {
             $moduleKey = "{0}|{1}|{2}" -f $moduleRecord.path, $moduleRecord.base, $moduleRecord.end
             if (-not $modulesSeen.ContainsKey($moduleKey)) {
                 $modulesSeen[$moduleKey] = $true
-                $modulesLoaded += $moduleRecord
-                $standardEvents += [PSCustomObject][ordered]@{
+                [void]$modulesLoaded.Add($moduleRecord)
+                [void]$standardEvents.Add([PSCustomObject][ordered]@{
                     event = "module_load"
                     module = $moduleRecord.module
                     path = $moduleRecord.path
                     base = $moduleRecord.base
                     end = $moduleRecord.end
                     size = $moduleRecord.size
-                }
+                })
             }
             continue
         }
 
         if ($eventType -eq "sample_execution") {
             $sourceModule = Get-LoadedModuleForAddress -Address $rawEvent.pc -Modules $modulesLoaded
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "sample_execution"
                 module = if ($sourceModule) { $sourceModule.module } elseif ($rawEvent.path) { Get-ModuleNameFromPath -Path $rawEvent.path } else { "unknown" }
                 path = if ($sourceModule) { $sourceModule.path } elseif ($rawEvent.path) { $rawEvent.path } else { $null }
@@ -167,13 +186,13 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 ts = $rawEvent.ts
                 kind = "client_probe"
-            }
+            })
             continue
         }
 
         if ($eventType -eq "exception_dispatch") {
             $sourceModule = Get-LoadedModuleForAddress -Address $rawEvent.address -Modules $modulesLoaded
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "exception_dispatch"
                 api = $rawEvent.api
                 module = if ($sourceModule) { $sourceModule.module } else { "unknown" }
@@ -184,12 +203,12 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 ts = $rawEvent.ts
                 kind = "client_probe"
-            }
+            })
             continue
         }
 
         if ($eventType -eq "raise_exception") {
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "raise_exception"
                 api = $rawEvent.api
                 code = $rawEvent.code
@@ -198,12 +217,12 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 ts = $rawEvent.ts
                 kind = "client_probe"
-            }
+            })
             continue
         }
 
         if ($eventType -eq "exception_handler_install") {
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "exception_handler_install"
                 api = $rawEvent.api
                 handler = $rawEvent.handler
@@ -211,7 +230,7 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 ts = $rawEvent.ts
                 kind = "client_probe"
-            }
+            })
             continue
         }
 
@@ -226,7 +245,7 @@ function Convert-NdjsonEventsToStandardFormat {
             $blockKey = "{0}|{1}" -f $sourcePath, $src
             if (-not $basicBlocksSeen.ContainsKey($blockKey)) {
                 $basicBlocksSeen[$blockKey] = $true
-                $standardEvents += [PSCustomObject][ordered]@{
+                [void]$standardEvents.Add([PSCustomObject][ordered]@{
                     event = "basic_block"
                     module = $sourceModuleName
                     path = $sourcePath
@@ -235,10 +254,10 @@ function Convert-NdjsonEventsToStandardFormat {
                     size = 0
                     kind = "cfg_trace"
                     tid = $tid
-                }
+                })
             }
 
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "sampled_block_execution"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -250,13 +269,13 @@ function Convert-NdjsonEventsToStandardFormat {
                 instruction_pointer = $src
                 tid = $tid
                 kind = "cfg_trace_ordered"
-            }
+            })
 
             $threadKey = [string]$tid
             if ($previousBlockByThread.ContainsKey($threadKey)) {
                 $previousBlock = $previousBlockByThread[$threadKey]
                 if ($previousBlock.source -ne $src) {
-                    $standardEvents += [PSCustomObject][ordered]@{
+                    [void]$standardEvents.Add([PSCustomObject][ordered]@{
                         event = "edge"
                         module = $previousBlock.module
                         path = $previousBlock.path
@@ -267,7 +286,7 @@ function Convert-NdjsonEventsToStandardFormat {
                         tid = $tid
                         count = 1
                         kind = "cfg_trace_implicit"
-                    }
+                    })
                 }
             }
             $previousBlockByThread[$threadKey] = [PSCustomObject]@{
@@ -279,7 +298,7 @@ function Convert-NdjsonEventsToStandardFormat {
         }
 
         if ($eventType -eq "call") {
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "call"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -289,8 +308,8 @@ function Convert-NdjsonEventsToStandardFormat {
                 target = $target
                 tid = $tid
                 kind = "direct_call"
-            }
-            $standardEvents += [PSCustomObject][ordered]@{
+            })
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "edge"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -301,12 +320,12 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 count = 1
                 kind = "call_edge"
-            }
+            })
             continue
         }
 
         if ($eventType -eq "ret") {
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "ret"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -316,8 +335,8 @@ function Convert-NdjsonEventsToStandardFormat {
                 target = $target
                 tid = $tid
                 kind = "return"
-            }
-            $standardEvents += [PSCustomObject][ordered]@{
+            })
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "edge"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -328,13 +347,13 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 count = 1
                 kind = "return_edge"
-            }
+            })
             continue
         }
 
         if ($eventType -eq "branch_taken" -or $eventType -eq "branch_not_taken") {
             $taken = $eventType -eq "branch_taken"
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "branch"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -345,8 +364,8 @@ function Convert-NdjsonEventsToStandardFormat {
                 taken = $taken
                 tid = $tid
                 kind = "conditional_branch"
-            }
-            $standardEvents += [PSCustomObject][ordered]@{
+            })
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "edge"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -357,12 +376,12 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 count = 1
                 kind = if ($taken) { "branch_taken_edge" } else { "branch_not_taken_edge" }
-            }
+            })
             continue
         }
 
         if ($eventType -eq "indirect_call") {
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "indirect_call"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -372,8 +391,8 @@ function Convert-NdjsonEventsToStandardFormat {
                 target = $target
                 tid = $tid
                 kind = "indirect_call"
-            }
-            $standardEvents += [PSCustomObject][ordered]@{
+            })
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "edge"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -384,12 +403,12 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 count = 1
                 kind = "indirect_call_edge"
-            }
+            })
             continue
         }
 
         if ($eventType -eq "indirect_jump") {
-            $standardEvents += [PSCustomObject][ordered]@{
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "indirect_jump"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -399,8 +418,8 @@ function Convert-NdjsonEventsToStandardFormat {
                 target = $target
                 tid = $tid
                 kind = "indirect_jump"
-            }
-            $standardEvents += [PSCustomObject][ordered]@{
+            })
+            [void]$standardEvents.Add([PSCustomObject][ordered]@{
                 event = "edge"
                 module = $sourceModuleName
                 path = $sourcePath
@@ -411,11 +430,11 @@ function Convert-NdjsonEventsToStandardFormat {
                 tid = $tid
                 count = 1
                 kind = "indirect_jump_edge"
-            }
+            })
         }
     }
 
-    return $standardEvents
+    return $standardEvents.ToArray()
 }
 
 function Get-DrcovLogProcessId {
@@ -459,7 +478,7 @@ function Parse-DrcovTextLog {
     param([string]$Path)
 
     $moduleMap = @{}
-    $basicBlocks = @()
+    $basicBlocks = New-ObjectList
     $processId = Get-DrcovLogProcessId -Path $Path
     $inModuleTable = $false
     $inBasicBlockTable = $false
@@ -533,12 +552,12 @@ function Parse-DrcovTextLog {
                     continue
                 }
 
-                $basicBlocks += [PSCustomObject]@{
+                [void]$basicBlocks.Add([PSCustomObject]@{
                     module_id = $moduleId
                     start_offset = [UInt64]$startOffset
                     size = [UInt64]$blockSize
                     sequence = $basicBlocks.Count
-                }
+                })
             }
         }
     }
@@ -547,7 +566,7 @@ function Parse-DrcovTextLog {
         process_id = $processId
         log_path = $Path
         modules = @($moduleMap.Values | Sort-Object module_id)
-        basic_blocks = @($basicBlocks)
+        basic_blocks = @($basicBlocks.ToArray())
     }
 }
 
@@ -557,33 +576,32 @@ function Convert-DrcovEntriesToEvents {
         $Request
     )
 
-    $events = @(
-        [ordered]@{
-            event = "trace_status"
-            trace_mode = $Request.trace_mode
-            trace_backend = "drio"
-            status = "drcov_basic_blocks"
-            message = "DRIO backend parsed DynamoRIO drcov basic-block coverage logs."
-            sample_name = $Request.sample_name
-            launched_pid = $Request.launched_pid
-            started_at = $Request.started_at
-            ended_at = $Request.ended_at
-        },
-        [ordered]@{
-            event = "trace_window"
-            sample_name = $Request.sample_name
-            launched_pid = $Request.launched_pid
-            started_at = $Request.started_at
-            ended_at = $Request.ended_at
-        }
-    )
+    $events = New-ObjectList
+    [void]$events.Add([ordered]@{
+        event = "trace_status"
+        trace_mode = $Request.trace_mode
+        trace_backend = "drio"
+        status = "drcov_basic_blocks"
+        message = "DRIO backend parsed DynamoRIO drcov basic-block coverage logs."
+        sample_name = $Request.sample_name
+        launched_pid = $Request.launched_pid
+        started_at = $Request.started_at
+        ended_at = $Request.ended_at
+    })
+    [void]$events.Add([ordered]@{
+        event = "trace_window"
+        sample_name = $Request.sample_name
+        launched_pid = $Request.launched_pid
+        started_at = $Request.started_at
+        ended_at = $Request.ended_at
+    })
 
     foreach ($log in $Logs) {
         $logProcessId = if ($log.process_id) { [int]$log.process_id } else { [int]$Request.launched_pid }
         $previousOrderedBlock = $null
 
         foreach ($moduleRecord in $log.modules) {
-            $events += [ordered]@{
+            [void]$events.Add([ordered]@{
                 event = "module_load"
                 module = $moduleRecord.module
                 path = $moduleRecord.path
@@ -591,7 +609,7 @@ function Convert-DrcovEntriesToEvents {
                 size = [UInt64]$moduleRecord.size
                 kind = "drcov_text"
                 pid = $logProcessId
-            }
+            })
         }
 
         foreach ($blockRecord in $log.basic_blocks) {
@@ -603,7 +621,7 @@ function Convert-DrcovEntriesToEvents {
             $startValue = [UInt64]($moduleRecord.base_value + $blockRecord.start_offset)
             $endValue = [UInt64]($startValue + $blockRecord.size)
 
-            $events += [ordered]@{
+            [void]$events.Add([ordered]@{
                 event = "basic_block"
                 module = $moduleRecord.module
                 path = $moduleRecord.path
@@ -612,7 +630,7 @@ function Convert-DrcovEntriesToEvents {
                 size = [UInt64]$blockRecord.size
                 kind = "drcov_text"
                 pid = $logProcessId
-            }
+            })
 
             $orderedBlockEvent = [ordered]@{
                 event = "sampled_block_execution"
@@ -627,10 +645,10 @@ function Convert-DrcovEntriesToEvents {
                 pid = $logProcessId
                 kind = "drcov_first_seen_order"
             }
-            $events += $orderedBlockEvent
+            [void]$events.Add($orderedBlockEvent)
 
             if ($previousOrderedBlock -and $previousOrderedBlock.module -eq $orderedBlockEvent.module) {
-                $events += [ordered]@{
+                [void]$events.Add([ordered]@{
                     event = "edge"
                     module = $orderedBlockEvent.module
                     path = $orderedBlockEvent.path
@@ -639,7 +657,7 @@ function Convert-DrcovEntriesToEvents {
                     pid = $logProcessId
                     count = 1
                     kind = "drcov_first_seen_order"
-                }
+                })
             }
 
             $previousOrderedBlock = [PSCustomObject]@{
@@ -649,7 +667,7 @@ function Convert-DrcovEntriesToEvents {
         }
     }
 
-    return $events
+    return $events.ToArray()
 }
 
 function Write-TraceSummary {
@@ -662,9 +680,9 @@ function Write-TraceSummary {
     )
 
     $moduleSeen = @{}
-    $moduleRecords = @()
+    $moduleRecords = New-ObjectList
     $basicBlockSeen = @{}
-    $basicBlocks = @()
+    $basicBlocks = New-ObjectList
     $orderedThreadSeen = @{}
     $orderedBlockSampleCount = 0
     $edgeSeen = @{}
@@ -694,7 +712,7 @@ function Write-TraceSummary {
             $moduleKey = "{0}|{1}|{2}|{3}" -f $event.module, $event.path, $event.base, $event.size
             if (-not $moduleSeen.ContainsKey($moduleKey)) {
                 $moduleSeen[$moduleKey] = $true
-                $moduleRecords += $event
+                [void]$moduleRecords.Add($event)
                 if (Test-IsSampleModulePath -Path $event.path -Request $Request) {
                     $sampleModuleSeen = $true
                 }
@@ -706,7 +724,7 @@ function Write-TraceSummary {
             $blockKey = "{0}|{1}|{2}" -f $event.module, $event.start, $event.end
             if (-not $basicBlockSeen.ContainsKey($blockKey)) {
                 $basicBlockSeen[$blockKey] = $true
-                $basicBlocks += $event
+                [void]$basicBlocks.Add($event)
                 if (Test-IsSampleModulePath -Path $event.path -Request $Request) {
                     $sampleBasicBlockCount += 1
                     $sampleModuleSeen = $true
@@ -778,33 +796,53 @@ function Write-TraceSummary {
         $null
     }
 
+    $summaryStatus = if ($CoverageMode -eq "control_flow_trace") { "control_flow_trace" } else { "drcov_basic_blocks" }
+    $summaryDrioMode = if ($CoverageMode -eq "control_flow_trace") { "cfg_tracer" } else { "drcov_text_first_seen_order" }
+    $clientBuildId = if ($clientMetadata) { $clientMetadata.build_id } else { $null }
+    $clientBypassAntidebug = if ($clientMetadata) { $clientMetadata.bypass_antidebug } else { $null }
+    $eventCount = @($Events).Count
+    $basicBlockCount = $basicBlocks.Count
+    $moduleCount = $moduleRecords.Count
+    $hasCallGraph = ($callCount -gt 0 -or $retCount -gt 0)
+    $hasIndirectTargets = ($indirectCallCount -gt 0 -or $indirectJumpCount -gt 0)
+    $summaryModules = @(
+        $moduleRecords.ToArray() | ForEach-Object {
+            [ordered]@{
+                module = $_.module
+                path = $_.path
+                base = $_.base
+                size = $_.size
+            }
+        }
+    )
+
     $summary = [ordered]@{
         trace_mode = $Request.trace_mode
         trace_backend = "drio"
-        status = if ($CoverageMode -eq "control_flow_trace") { "control_flow_trace" } else { "drcov_basic_blocks" }
+        status = $summaryStatus
         sample_name = $Request.sample_name
         launched_pid = $Request.launched_pid
         started_at = $Request.started_at
         ended_at = $Request.ended_at
-        event_count = @($Events).Count
-        basic_block_count = @($basicBlocks).Count
+        event_count = $eventCount
+        basic_block_count = $basicBlockCount
         edge_count = $edgeSeen.Count
-        module_count = @($moduleRecords).Count
+        module_count = $moduleCount
         ordered_block_sample_count = $orderedBlockSampleCount
         ordered_thread_count = $orderedThreadSeen.Count
         coverage_mode = $CoverageMode
         edge_source = $EdgeSource
-        has_call_graph = ($callCount -gt 0 -or $retCount -gt 0)
-        has_indirect_targets = ($indirectCallCount -gt 0 -or $indirectJumpCount -gt 0)
+        has_call_graph = $hasCallGraph
+        has_indirect_targets = $hasIndirectTargets
         call_count = $callCount
         ret_count = $retCount
         branch_count = $branchCount
         indirect_call_count = $indirectCallCount
         indirect_jump_count = $indirectJumpCount
-        drio_mode = if ($CoverageMode -eq "control_flow_trace") { "cfg_tracer" } else { "drcov_text_first_seen_order" }
-        client_build_id = if ($clientMetadata) { $clientMetadata.build_id } else { $null }
+        drio_mode = $summaryDrioMode
+        client_build_id = $clientBuildId
         bypass_antidebug_requested = $bypassAntiDebugFromRequest
-        bypass_antidebug_client = if ($clientMetadata) { $clientMetadata.bypass_antidebug } else { $null }
+        bypass_antidebug_client = $clientBypassAntidebug
         sample_module_seen = $sampleModuleSeen
         sample_basic_block_count = $sampleBasicBlockCount
         sample_call_count = $sampleCallCount
@@ -814,16 +852,7 @@ function Write-TraceSummary {
         raise_exception_count = $raiseExceptionCount
         exception_handler_install_count = $exceptionHandlerInstallCount
         system_only_trace = $systemOnlyTrace
-        modules = @(
-            $moduleRecords | ForEach-Object {
-                [ordered]@{
-                    module = $_.module
-                    path = $_.path
-                    base = $_.base
-                    size = $_.size
-                }
-            }
-        )
+        modules = $summaryModules
         notes = $Notes
     }
     $summary | ConvertTo-Json -Depth 8 | Set-Content -Path $SummaryPath -Encoding UTF8
@@ -949,10 +978,12 @@ for ($i = 0; $i -lt 5; $i++) {
 "Final result: $($ndjsonLogs.Count) ndjson files found" | Out-File $diagLog -Append
 
 if ($ndjsonLogs.Count -gt 0) {
-    $allRawEvents = @()
+    $allRawEvents = New-ObjectList
     foreach ($ndjsonLog in $ndjsonLogs) {
         $rawEvents = Parse-NdjsonTraceLog -Path $ndjsonLog.FullName
-        $allRawEvents += $rawEvents
+        foreach ($rawEvent in $rawEvents) {
+            [void]$allRawEvents.Add($rawEvent)
+        }
     }
 
     if ($allRawEvents.Count -eq 0) {
@@ -960,13 +991,8 @@ if ($ndjsonLogs.Count -gt 0) {
         exit 0
     }
 
-    $events = Convert-NdjsonEventsToStandardFormat -RawEvents $allRawEvents -Request $request
-
-    $encodedLines = @()
-    foreach ($event in $events) {
-        $encodedLines += ($event | ConvertTo-Json -Compress -Depth 8)
-    }
-    Set-Content -Path $OutputPath -Value ($encodedLines -join [Environment]::NewLine) -Encoding UTF8
+    $events = Convert-NdjsonEventsToStandardFormat -RawEvents $allRawEvents.ToArray() -Request $request
+    Write-EventsNdjson -Events $events -Path $OutputPath
 
     Write-TraceSummary -Events $events -Notes @(
         $message,
@@ -988,22 +1014,18 @@ if ($drcovLogs.Count -eq 0) {
     exit 0
 }
 
-$parsedLogs = @()
+$parsedLogs = New-ObjectList
 foreach ($drcovLog in $drcovLogs) {
-    $parsedLogs += Parse-DrcovTextLog -Path $drcovLog.FullName
+    [void]$parsedLogs.Add((Parse-DrcovTextLog -Path $drcovLog.FullName))
 }
 
-$events = Convert-DrcovEntriesToEvents -Logs $parsedLogs -Request $request
+$events = Convert-DrcovEntriesToEvents -Logs $parsedLogs.ToArray() -Request $request
 if (@($events | Where-Object { $_.event -eq "basic_block" }).Count -eq 0) {
     Invoke-PlaceholderFallback -Reason ("drcov logs were present under {0}, but no basic blocks were parsed; falling back to placeholder sampling." -f $drcovLogDir)
     exit 0
 }
 
-$encodedLines = @()
-foreach ($event in $events) {
-    $encodedLines += ($event | ConvertTo-Json -Compress -Depth 8)
-}
-Set-Content -Path $OutputPath -Value ($encodedLines -join [Environment]::NewLine) -Encoding UTF8
+Write-EventsNdjson -Events $events -Path $OutputPath
 
 Write-TraceSummary -Events $events -Notes @(
     "DRIO backend parsed DynamoRIO drcov basic-block coverage logs.",

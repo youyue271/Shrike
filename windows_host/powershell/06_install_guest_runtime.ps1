@@ -8,6 +8,7 @@ param(
     [string]$TraceBackendDrioSourcePath = "guest\runtime\trace_backend_drio.ps1",
     [string]$DrioClientBin32SourcePath = "guest\runtime\drio\bin32\shrike_drcov_nudge.dll",
     [string]$DrioClientBin64SourcePath = "guest\runtime\drio\bin64\shrike_drcov_nudge.dll",
+    [string]$DynamoRIOGuestInstallRoot = "C:\Tools\DynamoRIO",
     [string]$SysmonConfigSourcePath = "guest\runtime\sysmon_config.xml",
     [string]$SysmonBinarySourcePath = "windows_host\sysmon\sysmon64.exe",
     [string]$TaskName = "SandboxRunTask"
@@ -231,7 +232,12 @@ try {
                 $sysmonServiceStatus = $existingService.Status.ToString()
             }
 
-            $sysmonLog = Get-WinEvent -ListLog "Microsoft-Windows-Sysmon/Operational" -ErrorAction SilentlyContinue
+            try {
+                $sysmonLog = Get-WinEvent -ListLog "Microsoft-Windows-Sysmon/Operational" -ErrorAction Stop
+            } catch {
+                $sysmonLog = $null
+                $sysmonMessage = "{0}; Sysmon log query failed: {1}" -f $sysmonMessage, $_.Exception.Message
+            }
             $sysmonConfigured = $true
             $sysmonLogAvailable = [bool]$sysmonLog
         }
@@ -266,6 +272,33 @@ try {
         Copy-Item -Path $DrioClientBin64SourcePath -Destination "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll" -ToSession $session -Force
         Write-Log -Message ("Deployed DRIO client 64-bit DLL via Copy-Item -ToSession") -LogPath $logPath
     }
+
+    Invoke-Command -Session $session -ScriptBlock {
+        param($GuestInstallRoot)
+
+        function Copy-DrioClientDependencies {
+            param(
+                [Parameter(Mandatory = $true)]
+                [string]$Bitness
+            )
+
+            $dependencyNames = @("drmgr.dll", "drutil.dll", "drwrap.dll")
+            $sourceDir = Join-Path $GuestInstallRoot ("ext\lib{0}\release" -f $Bitness.Substring(3))
+            $destinationDir = Join-Path "C:\Sandbox\runtime\drio" $Bitness
+
+            foreach ($dependencyName in $dependencyNames) {
+                $sourcePath = Join-Path $sourceDir $dependencyName
+                if (-not (Test-Path $sourcePath)) {
+                    throw "Required DynamoRIO extension dependency not found: $sourcePath"
+                }
+                Copy-Item -Path $sourcePath -Destination (Join-Path $destinationDir $dependencyName) -Force
+            }
+        }
+
+        Copy-DrioClientDependencies -Bitness "bin32"
+        Copy-DrioClientDependencies -Bitness "bin64"
+    } -ArgumentList $DynamoRIOGuestInstallRoot
+    Write-Log -Message ("Deployed DRIO extension dependency DLLs from {0}" -f $DynamoRIOGuestInstallRoot) -LogPath $logPath
 
     } finally {
         if ($session) {

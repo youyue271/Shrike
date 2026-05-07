@@ -117,6 +117,72 @@ def copy_raw_artifacts(src_dir: Path, dst_dir: Path) -> list[str]:
     return copied
 
 
+RAW_ARTIFACT_CATEGORY_LABELS = {
+    "trace": "Trace",
+    "sysmon": "Sysmon",
+    "snapshots": "Pre/Post Snapshots",
+    "logs": "Logs",
+    "ransom_notes": "Ransom Notes",
+    "encrypted": "Encrypted",
+    "other": "Other",
+}
+
+
+def classify_raw_artifact(name: str) -> str:
+    lower_name = name.lower()
+    basename = Path(name).name.lower()
+    if lower_name.endswith(".xb7n5"):
+        return "encrypted"
+    if "readme" in basename and ("ransom" in basename or "xb7n5" in basename):
+        return "ransom_notes"
+    if (
+        lower_name.startswith("dynamic_cfg_")
+        or lower_name.startswith("trace_")
+        or "drio_logs/" in lower_name
+        or basename.startswith("drrun_")
+    ):
+        return "trace"
+    if lower_name.startswith("sysmon") or lower_name.endswith(".evtx"):
+        return "sysmon"
+    if (
+        "snapshot_" in lower_name
+        or lower_name.startswith("autorun_registry_")
+        or lower_name.startswith("dns_cache_")
+        or lower_name.startswith("tcp_snapshot_")
+        or lower_name.startswith("udp_snapshot_")
+        or lower_name.startswith("startup_folders_")
+    ):
+        return "snapshots"
+    if basename.endswith(".log") or basename.endswith(".txt"):
+        return "logs"
+    return "other"
+
+
+def summarize_raw_artifacts(raw_files: list[str]) -> dict[str, Any]:
+    by_category: dict[str, list[str]] = {key: [] for key in RAW_ARTIFACT_CATEGORY_LABELS}
+    encrypted_artifacts: list[dict[str, str]] = []
+
+    for name in raw_files:
+        category = classify_raw_artifact(name)
+        by_category.setdefault(category, []).append(name)
+        if name.lower().endswith(".xb7n5"):
+            original_name = name[: -len(".xb7n5")]
+            encrypted_artifacts.append(
+                {
+                    "name": name,
+                    "original_name": original_name,
+                    "family": "xb7n5",
+                }
+            )
+
+    return {
+        "total_count": len(raw_files),
+        "encrypted_count": len(encrypted_artifacts),
+        "encrypted_artifacts": encrypted_artifacts,
+        "by_category": {key: values for key, values in by_category.items() if values},
+    }
+
+
 def normalize_sample_name(task_summary: dict[str, Any] | None, sample_metadata: dict[str, Any] | None) -> str:
     for source in (sample_metadata, task_summary):
         if isinstance(source, dict) and source.get("sample_name"):
@@ -1410,6 +1476,7 @@ def build_summary(artifact_dir: Path, copied_files: list[str]) -> dict[str, Any]
         },
         "pre_post_diff": pre_post_diff,
         "raw_files": copied_files,
+        "artifacts": summarize_raw_artifacts(copied_files),
     }
 
 
@@ -1589,10 +1656,40 @@ def build_markdown_report(summary: dict[str, Any]) -> str:
         f"- Autorun registry changes: created=`{len(autorun_diff.get('created', {}))}` changed=`{len(autorun_diff.get('changed', {}))}` removed=`{len(autorun_diff.get('removed', {}))}`"
     )
     lines.append("")
-    lines.append("## Raw Files")
+    artifacts = summary.get("artifacts") or summarize_raw_artifacts(summary.get("raw_files", []))
+    lines.append("## Extracted Artifacts")
     lines.append("")
-    for name in summary.get("raw_files", []):
-        lines.append(f"- `{name}`")
+    lines.append(f"- Total raw files: `{artifacts.get('total_count', 0)}`")
+    lines.append(f"- Encrypted artifacts: `{artifacts.get('encrypted_count', 0)}`")
+    lines.append("")
+
+    encrypted_artifacts = artifacts.get("encrypted_artifacts", []) or []
+    if encrypted_artifacts:
+        lines.append("### Encrypted Artifacts")
+        lines.append("")
+        for item in encrypted_artifacts[:50]:
+            lines.append(
+                f"- `{item.get('name')}` original=`{item.get('original_name', 'unknown')}` "
+                f"family=`{item.get('family', 'unknown')}`"
+            )
+        if len(encrypted_artifacts) > 50:
+            lines.append(f"- ... truncated `{len(encrypted_artifacts) - 50}` more encrypted artifacts")
+        lines.append("")
+
+    by_category = artifacts.get("by_category", {}) or {}
+    lines.append("### Raw Artifact Groups")
+    lines.append("")
+    for category, label in RAW_ARTIFACT_CATEGORY_LABELS.items():
+        names = by_category.get(category, []) or []
+        if not names:
+            continue
+        lines.append(f"- {label}: `{len(names)}`")
+        for name in names[:12]:
+            lines.append(f"  - `{name}`")
+        if len(names) > 12:
+            lines.append(f"  - ... truncated `{len(names) - 12}` more")
+    if not by_category:
+        lines.append("- No raw artifact files copied.")
     return "\n".join(lines) + "\n"
 
 

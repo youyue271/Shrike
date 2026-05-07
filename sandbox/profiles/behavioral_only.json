@@ -1,0 +1,17 @@
+{
+  "profile_name": "behavioral_only",
+  "trace_mode": "behavioral",
+  "trace_backend": "none",
+  "network_mode": "airgap",
+  "user_simulation": "none",
+  "execution_window_seconds": 180,
+  "boot_stabilization_seconds": 30,
+  "backend_options": {},
+  "capture": {
+    "cfg": false,
+    "dfg": false,
+    "memory_writes": false,
+    "register_snapshots": false,
+    "behavioral_only": true
+  }
+}
