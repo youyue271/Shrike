@@ -142,7 +142,13 @@ The sandbox implements several anti-analysis evasion techniques:
 - **Impact**: `sandbox/scripts/analyze_sample.py` may fail because it invokes Windows PowerShell from a Python child process.
 - **Workaround**: use the top-level wrapper `windows_host/powershell/12_run_sandbox_wrapped.ps1`, which keeps Windows orchestration inside a single PowerShell process and only calls WSL for ISO build/report parsing.
 
-#### 5. Hyper-V Detection
+#### 5. Result Artifact Staging (MITIGATED 2026-05-07)
+- **Issue**: pre-execution sandbox artifacts written under `C:\Sandbox\output\staging` were visible to ransomware during the execution window and could be encrypted as `.xb7n5`.
+- **Mitigation**: small pre-execution artifacts now use the host ResultServer artifact channel first. The guest sends `pre` snapshots, `sample_metadata.json`, `task_profile.json`, and `task_runtime_context.json` over TCP to the host before or during launch instead of writing them directly to staging.
+- **Fallback**: if the ResultServer channel is unavailable, those artifacts are deferred and materialized to staging only after the sample execution window ends and the sample process is terminated.
+- **Host merge**: `analyze_sample.py`, `collect_report.py`, and `windows_host/powershell/12_run_sandbox_wrapped.ps1` merge `tmp/result_server_artifacts` into the mounted artifact staging directory before parsing.
+
+#### 6. Hyper-V Detection
 - **Issue**: VM-aware malware can detect Hyper-V environment
 - **Mitigation**: Minimal VM fingerprints, but hardware-level detection remains possible
 - **Future**: Consider Intel PT for hardware-level tracing (no software artifacts)
@@ -344,6 +350,16 @@ python sandbox/scripts/install_drio_runtime.py
 # Show current sandbox state
 .\09_show_sandbox_state.ps1
 ```
+
+#### Current Snapshot Backup
+
+Before enabling the ResultServer artifact-channel runtime and refreshing the sandbox baseline, the existing checkpoints were exported:
+
+- **Backup time**: `2026-05-07 16:14:50`
+- **VM**: `rw-sandbox-win10`
+- **Snapshots**: `analysis-base`, `maintenance-base`
+- **Backup path**: `sandbox_data\snapshot_backups\pre_network_artifact_20260507_161450`
+- **Export size**: `8` files, `32967419020` bytes
 
 ## Important Operating Rules
 

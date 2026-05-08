@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional report id to pass to the parser.",
     )
+    parser.add_argument(
+        "--merge-artifact-dir",
+        default=None,
+        help="Optional directory of host-received result-server artifacts to merge before parsing.",
+    )
     return parser.parse_args()
 
 
@@ -76,6 +81,17 @@ def extract_artifact_path(output: str) -> str:
     return match.group(1).strip()
 
 
+def merge_artifact_dir(src_dir: Path, dst_dir: Path) -> None:
+    if not src_dir.exists():
+        return
+    for item in sorted(src_dir.rglob("*")):
+        if item.is_file():
+            relative = item.relative_to(src_dir)
+            destination = dst_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, destination)
+
+
 def main() -> int:
     args = parse_args()
     root = project_root()
@@ -123,6 +139,9 @@ def main() -> int:
     sys.stderr.write(copy_result.stderr)
     if copy_result.returncode != 0:
         return copy_result.returncode
+
+    if args.merge_artifact_dir:
+        merge_artifact_dir(resolve_path(root, args.merge_artifact_dir), staging_dir)
 
     parse_cmd = [sys.executable, str(parse_script), str(staging_dir)]
     if args.report_id:

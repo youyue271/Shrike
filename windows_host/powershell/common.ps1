@@ -85,6 +85,50 @@ function Resolve-ProjectPath {
     return [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $Path))
 }
 
+function Resolve-WindowsPython {
+    $command = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($command -and $command.Source) {
+        return $command.Source
+    }
+
+    $knownPaths = @(
+        "C:\ProgramData\scoop\apps\python312\current\python.exe",
+        "C:\Users\YOUYUE\scoop\apps\python311\current\python.exe",
+        "D:\project\ransomware\article\.word-mcp-win\Scripts\python.exe"
+    )
+
+    foreach ($path in $knownPaths) {
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+
+    throw "Windows python.exe not found; ResultServer must run on the Windows host so it can bind the Hyper-V internal IP."
+}
+
+function Get-ArtifactPathFromMountOutput {
+    param(
+        [AllowNull()]
+        [object[]]$MountOutput
+    )
+
+    foreach ($entry in @($MountOutput)) {
+        if ($null -eq $entry) {
+            continue
+        }
+
+        $text = ([string]$entry) -replace "`0", ""
+        foreach ($line in ($text -split "\r?\n")) {
+            $normalized = $line.Trim()
+            if ($normalized -match "^Artifact path:\s*(.+)$") {
+                return $Matches[1].Trim()
+            }
+        }
+    }
+
+    return $null
+}
+
 function Test-PathWithinRoot {
     param(
         [Parameter(Mandatory = $true)]

@@ -34,10 +34,10 @@ try {
 
     $mountPoint = "{0}:\artifact" -f $volume.DriveLetter
     Write-Log -Message ("Mounted artifact disk at drive letter {0}" -f $volume.DriveLetter) -LogPath $logPath
-    Write-Host ("Artifact path: {0}" -f $mountPoint)
-    Write-Host ("Log file: {0}" -f $logPath)
+    Write-Output ("Artifact path: {0}" -f $mountPoint)
+    Write-Output ("Log file: {0}" -f $logPath)
 } catch {
     Write-Log -Message $_.Exception.Message -LogPath $logPath -Level "ERROR"
-    Write-Host ("Log file: {0}" -f $logPath)
+    Write-Output ("Log file: {0}" -f $logPath)
     throw
 }

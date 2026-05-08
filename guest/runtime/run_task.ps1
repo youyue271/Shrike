@@ -6,6 +6,10 @@ $executionWindowSeconds = 120
 $mediaWaitTimeoutSeconds = 120
 $mediaPollIntervalSeconds = 3
 $bootStabilizationSeconds = 30
+$resultServerHost = "192.168.100.1"
+$resultServerPort = 42042
+$runnerLogLines = New-Object 'System.Collections.Generic.List[string]'
+$script:TraceBackendScriptContentCache = @{}
 
 New-Item -ItemType Directory -Force $localOutputRoot | Out-Null
 Set-Content -Path $runnerLog -Value ""
@@ -13,7 +17,22 @@ Set-Content -Path $runnerLog -Value ""
 function Write-RunnerLog {
     param([string]$Message)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    $script:runnerLogLines.Add($line)
     Add-Content -Path $runnerLog -Value $line
+}
+
+function Save-RunnerLogSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    $parent = Split-Path -Parent $Destination
+    if ($parent) {
+        New-Item -ItemType Directory -Force $parent | Out-Null
+    }
+
+    [System.IO.File]::WriteAllLines($Destination, $script:runnerLogLines, [System.Text.Encoding]::UTF8)
 }
 
 function Export-JsonFile {
@@ -31,6 +50,122 @@ function Export-JsonFile {
     }
 
     $InputObject | ConvertTo-Json -Depth 8 | Set-Content -Path $Path -Encoding UTF8
+}
+
+function ConvertTo-JsonText {
+    param($InputObject)
+
+    if (($InputObject -is [System.Collections.IEnumerable]) -and -not ($InputObject -is [string]) -and @($InputObject).Count -eq 0) {
+        return "[]"
+    }
+
+    return ($InputObject | ConvertTo-Json -Depth 8)
+}
+
+function ConvertTo-CsvText {
+    param($Rows)
+
+    if ($null -eq $Rows) {
+        return ""
+    }
+
+    $rowArray = @($Rows)
+    if ($rowArray.Count -eq 0) {
+        return ""
+    }
+
+    $csvLines = @($rowArray | ConvertTo-Csv -NoTypeInformation)
+    if ($csvLines.Count -eq 0) {
+        return ""
+    }
+    return ($csvLines -join [Environment]::NewLine) + [Environment]::NewLine
+}
+
+function New-TextResultArtifact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [string]$Content
+    )
+
+    if ($null -eq $Content) {
+        $Content = ""
+    }
+
+    return [PSCustomObject]@{
+        Name = $Name
+        Content = $Content
+    }
+}
+
+function Send-ResultArtifact {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Artifact,
+
+        [string]$HostName = $resultServerHost,
+        [int]$Port = $resultServerPort,
+        [int]$TimeoutMilliseconds = 1000
+    )
+
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $async = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) {
+            throw "connect timeout"
+        }
+        $client.EndConnect($async)
+
+        $contentBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Artifact.Content)
+        $payload = [ordered]@{
+            type = "artifact"
+            name = [string]$Artifact.Name
+            content_base64 = [Convert]::ToBase64String($contentBytes)
+        }
+        $line = ($payload | ConvertTo-Json -Compress -Depth 5) + "`n"
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+        $stream = $client.GetStream()
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+        Write-RunnerLog ("streamed result artifact {0}" -f $Artifact.Name)
+        return $true
+    } catch {
+        Write-RunnerLog ("stream result artifact failed name={0}: {1}" -f $Artifact.Name, $_.Exception.Message)
+        return $false
+    } finally {
+        if ($client) {
+            $client.Close()
+        }
+    }
+}
+
+function Send-PreExecutionArtifacts {
+    param([array]$Artifacts)
+
+    $deferred = @()
+    foreach ($artifact in @($Artifacts)) {
+        if (-not (Send-ResultArtifact -Artifact $artifact)) {
+            $deferred += $artifact
+        }
+    }
+
+    Write-RunnerLog ("deferred {0} of {1} pre-execution artifacts for post-execution publication" -f @($deferred).Count, @($Artifacts).Count)
+    return @($deferred)
+}
+
+function Write-DeferredResultArtifacts {
+    param(
+        [array]$Artifacts,
+        [string]$ArtifactDir
+    )
+
+    foreach ($artifact in @($Artifacts)) {
+        $path = Join-Path $ArtifactDir ([string]$artifact.Name)
+        Set-Content -Path $path -Value ([string]$artifact.Content) -Encoding UTF8
+        Write-RunnerLog ("materialized deferred result artifact {0}" -f $artifact.Name)
+    }
 }
 
 function Invoke-NativeCommandSafe {
@@ -202,6 +337,112 @@ function Export-SnapshotBundle {
     Write-RunnerLog ("exported {0} snapshot bundle" -f $Prefix)
 }
 
+function Get-RegistrySnapshotEntries {
+    $targets = @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+
+    $result = @()
+    foreach ($target in $targets) {
+        if (Test-Path $target) {
+            $props = Get-ItemProperty -Path $target
+            $entry = [ordered]@{
+                Path = $target
+                Values = @{}
+            }
+
+            foreach ($p in $props.PSObject.Properties) {
+                if ($p.Name -notmatch "^PS") {
+                    $entry.Values[$p.Name] = $p.Value
+                }
+            }
+
+            $result += [PSCustomObject]$entry
+        } else {
+            $result += [PSCustomObject]@{
+                Path = $target
+                Values = @{}
+            }
+        }
+    }
+
+    return @($result)
+}
+
+function Get-StartupFolderSnapshotRows {
+    $folders = @(
+        "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+    )
+
+    $entries = foreach ($folder in $folders) {
+        if (Test-Path $folder) {
+            Get-ChildItem -Path $folder -Force |
+                Select-Object @{
+                    Name = "Folder"
+                    Expression = { $folder }
+                }, Name, FullName, Length, LastWriteTime
+        }
+    }
+
+    return @($entries)
+}
+
+function New-SnapshotBundleArtifacts {
+    param([string]$Prefix)
+
+    $artifacts = @()
+    $artifacts += New-TextResultArtifact -Name ("process_snapshot_{0}.csv" -f $Prefix) -Content (ConvertTo-CsvText -Rows (
+        Get-CimInstance Win32_Process |
+            Select-Object Name, ProcessId, ParentProcessId, ExecutablePath, CommandLine, CreationDate |
+            Sort-Object Name, ProcessId
+    ))
+    $artifacts += New-TextResultArtifact -Name ("service_snapshot_{0}.csv" -f $Prefix) -Content (ConvertTo-CsvText -Rows (
+        Get-CimInstance Win32_Service |
+            Select-Object Name, DisplayName, State, StartMode, PathName |
+            Sort-Object Name
+    ))
+    $artifacts += New-TextResultArtifact -Name ("scheduled_task_snapshot_{0}.csv" -f $Prefix) -Content (ConvertTo-CsvText -Rows (
+        Get-ScheduledTask |
+            Select-Object TaskName, TaskPath, State, Author, Description |
+            Sort-Object TaskPath, TaskName
+    ))
+
+    try {
+        $tcpRows = Get-NetTCPConnection |
+            Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess |
+            Sort-Object LocalAddress, LocalPort, RemoteAddress, RemotePort
+    } catch {
+        $tcpRows = @()
+    }
+    $artifacts += New-TextResultArtifact -Name ("tcp_snapshot_{0}.csv" -f $Prefix) -Content (ConvertTo-CsvText -Rows $tcpRows)
+
+    try {
+        $udpRows = Get-NetUDPEndpoint |
+            Select-Object LocalAddress, LocalPort, OwningProcess |
+            Sort-Object LocalAddress, LocalPort
+    } catch {
+        $udpRows = @()
+    }
+    $artifacts += New-TextResultArtifact -Name ("udp_snapshot_{0}.csv" -f $Prefix) -Content (ConvertTo-CsvText -Rows $udpRows)
+
+    try {
+        $dnsRows = Get-DnsClientCache |
+            Select-Object Entry, RecordType, Data, TimeToLive, Status |
+            Sort-Object Entry, RecordType
+    } catch {
+        $dnsRows = @()
+    }
+    $artifacts += New-TextResultArtifact -Name ("dns_cache_{0}.csv" -f $Prefix) -Content (ConvertTo-CsvText -Rows $dnsRows)
+    $artifacts += New-TextResultArtifact -Name ("autorun_registry_{0}.json" -f $Prefix) -Content (ConvertTo-JsonText -InputObject (Get-RegistrySnapshotEntries))
+    $artifacts += New-TextResultArtifact -Name ("startup_folders_{0}.csv" -f $Prefix) -Content (ConvertTo-CsvText -Rows (Get-StartupFolderSnapshotRows))
+    Write-RunnerLog ("captured {0} snapshot bundle in memory" -f $Prefix)
+    return @($artifacts)
+}
+
 function Publish-StagingArtifacts {
     param(
         [string]$StagingDir,
@@ -220,10 +461,156 @@ function Publish-StagingArtifacts {
         Copy-Item -Destination $ArtifactDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+function Get-TraceBackendScriptPath {
+    param(
+        [string]$TraceMode,
+        [string]$TraceBackend
+    )
+
+    if ($TraceMode -ne "dynamic_cfg") {
+        return $null
+    }
+
+    switch ($TraceBackend) {
+        "drio" { return "C:\Sandbox\runtime\trace_backend_drio.ps1" }
+        "placeholder" { return "C:\Sandbox\runtime\trace_backend_placeholder.ps1" }
+        default { return $null }
+    }
+}
+
+function Save-TraceBackendScriptContent {
+    param([string]$TraceBackendScriptPath)
+
+    if ($TraceBackendScriptPath -and (Test-Path $TraceBackendScriptPath)) {
+        $script:TraceBackendScriptContentCache[$TraceBackendScriptPath] = Get-Content -Path $TraceBackendScriptPath -Raw -Encoding UTF8
+    }
+}
+
+function Restore-TraceBackendScriptIfMissing {
+    param([string]$TraceBackendScriptPath)
+
+    if (-not $TraceBackendScriptPath -or (Test-Path $TraceBackendScriptPath)) {
+        return
+    }
+
+    if ($script:TraceBackendScriptContentCache.ContainsKey($TraceBackendScriptPath)) {
+        $parent = Split-Path -Parent $TraceBackendScriptPath
+        if ($parent) {
+            New-Item -ItemType Directory -Force $parent | Out-Null
+        }
+        Set-Content -Path $TraceBackendScriptPath -Value $script:TraceBackendScriptContentCache[$TraceBackendScriptPath] -Encoding UTF8
+        Write-RunnerLog ("restored trace backend script {0}" -f $TraceBackendScriptPath)
+    }
+}
+
+function Should-DeferTraceExport {
+    param($TaskProfile)
+
+    $traceMode = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "trace_mode" -Default "none"
+    $traceBackend = Get-TaskProfileValue -TaskProfile $TaskProfile -Name "trace_backend" -Default "none"
+    return ($traceMode -eq "dynamic_cfg" -and $traceBackend -eq "drio")
+}
+
+function Get-DrioDrrunPath {
+    param([bool]$Is32Bit)
+
+    if ($Is32Bit) {
+        return "C:\Tools\DynamoRIO\bin32\drrun.exe"
+    }
+    return "C:\Tools\DynamoRIO\bin64\drrun.exe"
+}
+
+function Get-DrioClientRuntimePaths {
+    return [PSCustomObject]@{
+        Bin32 = "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll"
+        Bin64 = "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll"
+    }
+}
+
+function Get-DrioNudgeTargetNames {
+    param([string]$SampleName)
+
+    $targetNames = New-Object System.Collections.ArrayList
+    if ($SampleName) {
+        [void]$targetNames.Add($SampleName)
+        if (-not [System.IO.Path]::HasExtension($SampleName)) {
+            [void]$targetNames.Add(("{0}.exe" -f $SampleName))
+        }
+    }
+
+    return @($targetNames)
+}
+
+function Invoke-DrioNudgeForTraceTargets {
+    param(
+        [string]$SampleName,
+        [int[]]$TreeIds = @()
+    )
+
+    $targetNames = Get-DrioNudgeTargetNames -SampleName $SampleName
+    foreach ($targetName in $targetNames) {
+        foreach ($drrunPath in @("C:\Tools\DynamoRIO\bin32\drrun.exe", "C:\Tools\DynamoRIO\bin64\drrun.exe")) {
+            if (Test-Path $drrunPath) {
+                try {
+                    & $drrunPath "-nudge" $targetName 2>$null | Out-Null
+                    Write-RunnerLog ("sent DRIO nudge target={0}" -f $targetName)
+                } catch {
+                    Write-RunnerLog ("DRIO nudge failed target={0}: {1}" -f $targetName, $_.Exception.Message)
+                }
+            }
+        }
+    }
+}
+
+function Invoke-TraceTreeTaskkill {
+    param(
+        [int]$LauncherProcessId,
+        [switch]$Force
+    )
+
+    $args = @("/PID", $LauncherProcessId.ToString(), "/T")
+    if ($Force) {
+        $args += "/F"
+    }
+    try {
+        & taskkill.exe @args 2>$null | Out-Null
+    } catch {}
+}
+
+function Stop-TraceLauncherProcessTree {
+    param(
+        [int]$LauncherProcessId,
+        [string]$SampleName = $null
+    )
+
+    $treeIds = @($LauncherProcessId)
+    Invoke-DrioNudgeForTraceTargets -SampleName $SampleName -TreeIds $treeIds
+    Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId
+    Start-Sleep -Seconds 5
+    Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId -Force
+}
+
+function Remove-InvalidXmlChars {
+    param([string]$Text)
+
+    if ($null -eq $Text) {
+        return $null
+    }
+
+    return [regex]::Replace($Text, "[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD]", "")
+}
+
+function Convert-EventRecordToSafeXml {
+    param([System.Diagnostics.Eventing.Reader.EventRecord]$Event)
+
+    $xmlText = Remove-InvalidXmlChars -Text $Event.ToXml()
+    return [xml]$xmlText
+}
+
 function Get-SysmonEventObject {
     param([System.Diagnostics.Eventing.Reader.EventRecord]$Event)
 
-    $xml = [xml]$Event.ToXml()
+    $xml = Convert-EventRecordToSafeXml -Event $Event
     $data = [ordered]@{
         RecordId = $Event.RecordId
         TimeCreated = if ($Event.TimeCreated) { $Event.TimeCreated.ToString("o") } else { $null }
@@ -275,7 +662,7 @@ function Get-SysmonDataValue {
     )
 
     try {
-        $xml = [xml]$Event.ToXml()
+        $xml = Convert-EventRecordToSafeXml -Event $Event
         foreach ($node in $xml.Event.EventData.Data) {
             if ($node.Name -eq $Name) {
                 return $node.'#text'
@@ -537,11 +924,9 @@ function Export-TraceArtifacts {
         $traceDiagnosticPath = Join-Path $ArtifactDir "trace_backend_diagnostic.json"
 
         if ($traceMode -eq "dynamic_cfg" -and ($traceBackend -eq "placeholder" -or $traceBackend -eq "drio")) {
-            $backendScript = if ($traceBackend -eq "drio") {
-                "C:\Sandbox\runtime\trace_backend_drio.ps1"
-            } else {
-                "C:\Sandbox\runtime\trace_backend_placeholder.ps1"
-            }
+            $traceBackendScript = Get-TraceBackendScriptPath -TraceMode $traceMode -TraceBackend $traceBackend
+            $backendScript = $traceBackendScript
+            Restore-TraceBackendScriptIfMissing -TraceBackendScriptPath $traceBackendScript
 
             if (-not (Test-Path $backendScript)) {
                 $traceStatus = "backend_missing"
@@ -624,6 +1009,42 @@ function Export-TraceArtifacts {
     Write-RunnerLog "exported trace_manifest.json"
 }
 
+function Capture-TraceArtifactsToBuffer {
+    param(
+        $TaskProfile,
+        $TaskRuntimeContext,
+        [string]$SampleName,
+        [string]$SamplePath,
+        [int]$LaunchedPid,
+        [datetime]$StartedAt,
+        [datetime]$EndedAt,
+        [string]$DrioLogDir = $null,
+        [bool]$BypassAntidebug = $false
+    )
+
+    $traceArtifactBuffer = Join-Path $localOutputRoot "trace_buffer"
+    Remove-Item -Path $traceArtifactBuffer -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force $traceArtifactBuffer | Out-Null
+    Export-TraceArtifacts -TaskProfile $TaskProfile -TaskRuntimeContext $TaskRuntimeContext -ArtifactDir $traceArtifactBuffer -SampleName $SampleName -SamplePath $SamplePath -LaunchedPid $LaunchedPid -StartedAt $StartedAt -EndedAt $EndedAt -DrioLogDir $DrioLogDir -BypassAntidebug $BypassAntidebug
+    return $traceArtifactBuffer
+}
+
+function Write-TraceArtifactBuffer {
+    param(
+        [string]$TraceArtifactBuffer,
+        [string]$ArtifactDir
+    )
+
+    if (-not $TraceArtifactBuffer -or -not (Test-Path $TraceArtifactBuffer)) {
+        return
+    }
+
+    New-Item -ItemType Directory -Force $ArtifactDir | Out-Null
+    Get-ChildItem -Path $TraceArtifactBuffer -Force -ErrorAction SilentlyContinue |
+        Copy-Item -Destination $ArtifactDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-RunnerLog "wrote trace artifact buffer"
+}
+
 try {
     Write-RunnerLog "task start"
 
@@ -688,7 +1109,8 @@ try {
     New-Item -ItemType Directory -Force $stagingDir | Out-Null
     Get-ChildItem -Path $localInput -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-    Export-SnapshotBundle -Prefix "pre" -ArtifactDir $stagingDir
+    $preExecutionArtifacts = New-SnapshotBundleArtifacts -Prefix "pre"
+    $deferredResultArtifacts = Send-PreExecutionArtifacts -Artifacts $preExecutionArtifacts
 
     Get-ChildItem $sampleDir | Copy-Item -Destination $localInput -Force
     Write-RunnerLog "copied sample to local input"
@@ -698,15 +1120,30 @@ try {
 
     $start = Get-Date
     $sampleHash = Get-FileHash -Path $sample.FullName -Algorithm SHA256
+    $taskRuntimeContext = [ordered]@{
+        execution_window_seconds = $executionWindowSeconds
+        boot_stabilization_seconds = $bootStabilizationSeconds
+        trace_mode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_mode" -Default "none"
+        trace_backend = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_backend" -Default "none"
+        network_mode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "network_mode" -Default "airgap"
+        user_simulation = Get-TaskProfileValue -TaskProfile $taskProfile -Name "user_simulation" -Default "none"
+        profile_name = Get-TaskProfileValue -TaskProfile $taskProfile -Name "profile_name" -Default "default"
+    }
     Write-RunnerLog ("launching sample {0}" -f $sample.FullName)
 
     $drioLogDir = $null
     $bypassAntidebug = $false
     $traceBackendName = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_backend" -Default "none"
     $traceModeName = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_mode" -Default "none"
+    $traceBackendScriptPath = Get-TraceBackendScriptPath -TraceMode $traceModeName -TraceBackend $traceBackendName
+    $traceBackendScript = $traceBackendScriptPath
+    Save-TraceBackendScriptContent -TraceBackendScriptPath $traceBackendScriptPath
+    $deferTraceExport = Should-DeferTraceExport -TaskProfile $taskProfile
+    $traceArtifactBuffer = $null
 
     if ($traceModeName -eq "dynamic_cfg" -and $traceBackendName -eq "drio") {
-        $drioLogDir = $drioLogDirRoot
+        $drioLogDir = Join-Path $artifactDir "drio"
+        $drioLogDirRoot = $drioLogDir
         New-Item -ItemType Directory -Force $drioLogDir | Out-Null
 
         $is32bit = $false
@@ -723,10 +1160,11 @@ try {
             Write-RunnerLog ("PE header read failed: {0}; assuming 64-bit" -f $_.Exception.Message)
         }
 
-        $drrunExe = if ($is32bit) { "C:\Tools\DynamoRIO\bin32\drrun.exe" } else { "C:\Tools\DynamoRIO\bin64\drrun.exe" }
-        $clientDll = if ($is32bit) { "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll" } else { "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll" }
+        $drrunPath = Get-DrioDrrunPath -Is32Bit $is32bit
+        $drioClientRuntimePaths = Get-DrioClientRuntimePaths
+        $clientDll = if ($is32bit) { $drioClientRuntimePaths.Bin32 } else { $drioClientRuntimePaths.Bin64 }
 
-        if ((Test-Path $drrunExe) -and (Test-Path $clientDll)) {
+        if ((Test-Path $drrunPath) -and (Test-Path $clientDll)) {
             $backendOpts = Get-TaskProfileValue -TaskProfile $taskProfile -Name "backend_options" -Default @{}
             $bypassAntidebug = $false
             if ($backendOpts) {
@@ -741,7 +1179,13 @@ try {
                 Write-RunnerLog ("created .exe copy for extensionless DRIO sample: {0}" -f $launchPath)
             }
 
-            $drrunArgs = @("-c", $clientDll, "-logdir", $drioLogDir, "-result_server_host", "192.168.100.1", "-result_server_port", "2042")
+            $drrunArgs = @(
+                "-c32", "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll",
+                "-c64", "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll",
+                "-dump_text",
+                "-logdir", $drioLogDir,
+                "-logprefix", "shrike"
+            )
             if ($bypassAntidebug) {
                 $drrunArgs += "-bypass_antidebug"
             }
@@ -749,10 +1193,17 @@ try {
 
             $drrunStdoutPath = Join-Path $stagingDir "drrun_stdout.txt"
             $drrunStderrPath = Join-Path $stagingDir "drrun_stderr.txt"
-            Write-RunnerLog ("launching via drrun: {0} {1}" -f $drrunExe, ($drrunArgs -join " "))
-            $proc = Start-Process -FilePath $drrunExe -ArgumentList $drrunArgs -RedirectStandardOutput $drrunStdoutPath -RedirectStandardError $drrunStderrPath -PassThru
+            Write-RunnerLog ("launching via drrun: {0} {1}" -f $drrunPath, ($drrunArgs -join " "))
+            $proc = Start-Process -FilePath $drrunPath -ArgumentList @(
+                "-c32", "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll",
+                "-c64", "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll",
+                "-dump_text",
+                "-logdir", $drioLogDir,
+                "-logprefix", "shrike",
+                "--", $launchPath
+            ) -RedirectStandardOutput $drrunStdoutPath -RedirectStandardError $drrunStderrPath -PassThru
         } else {
-            Write-RunnerLog ("drrun or client DLL not found (drrun={0} client={1}); launching sample directly" -f $drrunExe, $clientDll)
+            Write-RunnerLog ("drrun or client DLL not found (drrun={0} client={1}); launching sample directly" -f $drrunPath, $clientDll)
             $launchPath = $sample.FullName
             if (-not $sample.Extension) {
                 $launchPath = Join-Path $sample.DirectoryName ("{0}.exe" -f $sample.Name)
@@ -771,6 +1222,7 @@ try {
         $proc = Start-Process -FilePath $launchPath -PassThru
     }
     Write-RunnerLog ("launched sample pid={0}" -f $proc.Id)
+    $launcher = if ($deferTraceExport) { "drrun_custom_drcov_client" } else { "direct" }
     $plannedTraceEnd = $start.AddSeconds($executionWindowSeconds)
 
     $sampleMetadata = [ordered]@{
@@ -781,30 +1233,26 @@ try {
         launched_pid = $proc.Id
         execution_window_seconds = $executionWindowSeconds
     }
-    Export-JsonFile -InputObject $sampleMetadata -Path (Join-Path $stagingDir "sample_metadata.json")
-    Write-RunnerLog "exported sample_metadata.json"
+    $sampleMetadataArtifact = New-TextResultArtifact -Name "sample_metadata.json" -Content (ConvertTo-JsonText -InputObject $sampleMetadata)
+    if (-not (Send-ResultArtifact -Artifact $sampleMetadataArtifact)) {
+        $deferredResultArtifacts += $sampleMetadataArtifact
+    }
 
     if ($taskProfile) {
-        Export-JsonFile -InputObject $taskProfile -Path (Join-Path $stagingDir "task_profile.json")
-        Write-RunnerLog "exported task_profile.json"
+        $taskProfileArtifact = New-TextResultArtifact -Name "task_profile.json" -Content (ConvertTo-JsonText -InputObject $taskProfile)
+        if (-not (Send-ResultArtifact -Artifact $taskProfileArtifact)) {
+            $deferredResultArtifacts += $taskProfileArtifact
+        }
     }
 
-    $taskRuntimeContext = [ordered]@{
-        execution_window_seconds = $executionWindowSeconds
-        boot_stabilization_seconds = $bootStabilizationSeconds
-        trace_mode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_mode" -Default "none"
-        trace_backend = Get-TaskProfileValue -TaskProfile $taskProfile -Name "trace_backend" -Default "none"
-        network_mode = Get-TaskProfileValue -TaskProfile $taskProfile -Name "network_mode" -Default "airgap"
-        user_simulation = Get-TaskProfileValue -TaskProfile $taskProfile -Name "user_simulation" -Default "none"
-        profile_name = Get-TaskProfileValue -TaskProfile $taskProfile -Name "profile_name" -Default "default"
+    $taskRuntimeContextArtifact = New-TextResultArtifact -Name "task_runtime_context.json" -Content (ConvertTo-JsonText -InputObject $taskRuntimeContext)
+    if (-not (Send-ResultArtifact -Artifact $taskRuntimeContextArtifact)) {
+        $deferredResultArtifacts += $taskRuntimeContextArtifact
     }
-    Export-JsonFile -InputObject $taskRuntimeContext -Path (Join-Path $stagingDir "task_runtime_context.json")
-    Write-RunnerLog "exported task_runtime_context.json"
 
-    if ($traceBackendName -ne "drio") {
-        Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
-        Copy-Item $runnerLog -Destination (Join-Path $stagingDir "runner.log") -Force
-        Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "after trace export"
+    if (-not $deferTraceExport) {
+        $traceArtifactBuffer = Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+        Save-RunnerLogSnapshot -Destination (Join-Path $stagingDir "runner.log")
     }
 
     Start-Sleep -Seconds $executionWindowSeconds
@@ -812,13 +1260,17 @@ try {
     $end = Get-Date
     Write-RunnerLog "execution window ended"
 
-    try {
-        $sampleProc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-        if ($sampleProc -and -not $sampleProc.HasExited) {
-            $sampleProc.Kill()
-            Write-RunnerLog ("killed sample process pid={0}" -f $proc.Id)
-        }
-    } catch {}
+    if ($deferTraceExport) {
+        Stop-TraceLauncherProcessTree -LauncherProcessId $proc.Id -SampleName $sample.Name
+    } else {
+        try {
+            $sampleProc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+            if ($sampleProc -and -not $sampleProc.HasExited) {
+                $sampleProc.Kill()
+                Write-RunnerLog ("killed sample process pid={0}" -f $proc.Id)
+            }
+        } catch {}
+    }
     try {
         Get-Process | Where-Object { $_.Path -and $_.Path -like "*\Sandbox\input\*" } | ForEach-Object {
             $_.Kill()
@@ -826,9 +1278,22 @@ try {
         }
     } catch {}
 
-    if ($traceBackendName -eq "drio") {
-        Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
-        Copy-Item $runnerLog -Destination (Join-Path $stagingDir "runner.log") -Force
+    Write-DeferredResultArtifacts -Artifacts $deferredResultArtifacts -ArtifactDir $stagingDir
+
+    if (-not $deferTraceExport) {
+        Write-TraceArtifactBuffer -TraceArtifactBuffer $traceArtifactBuffer -ArtifactDir $artifactDir
+        Save-RunnerLogSnapshot -Destination (Join-Path $stagingDir "runner.log")
+        Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "after non-deferred trace export"
+    }
+
+    if ($deferTraceExport) {
+        Restore-TraceBackendScriptIfMissing -TraceBackendScriptPath $traceBackendScript
+        # Contract anchor: DRIO export happens after Stop-TraceLauncherProcessTree and before Sysmon collection.
+        # Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd
+        # Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+        $traceArtifactBuffer = Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+        Write-TraceArtifactBuffer -TraceArtifactBuffer $traceArtifactBuffer -ArtifactDir $stagingDir
+        Save-RunnerLogSnapshot -Destination (Join-Path $stagingDir "runner.log")
         Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "after trace export"
     }
 
@@ -910,7 +1375,7 @@ try {
         Set-Content (Join-Path $stagingDir "task_summary.json")
     Write-RunnerLog "exported task_summary.json"
 
-    Copy-Item $runnerLog -Destination (Join-Path $stagingDir "runner.log") -Force
+    Save-RunnerLogSnapshot -Destination (Join-Path $stagingDir "runner.log")
 
     Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "final"
 
@@ -921,7 +1386,7 @@ try {
         if ($artifactDrive) {
             $artifactDir = Join-Path $artifactDrive "artifact"
             New-Item -ItemType Directory -Force $artifactDir | Out-Null
-            Copy-Item $runnerLog -Destination (Join-Path $artifactDir "runner.log") -Force
+            Save-RunnerLogSnapshot -Destination (Join-Path $artifactDir "runner.log")
         }
     } catch {}
     throw

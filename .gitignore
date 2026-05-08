@@ -7,6 +7,7 @@ sandbox_data/hyperv/
 sandbox_data/iso/
 sandbox_data/task_media/
 sandbox_data/exports/
+sandbox_data/snapshot_backups/
 
 windows_host/logs/
 reports/

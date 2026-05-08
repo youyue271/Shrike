@@ -918,9 +918,12 @@ function Invoke-PlaceholderFallback {
     $summaryObject | ConvertTo-Json -Depth 8 | Set-Content -Path $SummaryPath -Encoding UTF8
 }
 
-# Use the temp directory path from trace_request where drrun actually wrote the files
-# The trace backend runs BEFORE artifacts are published, so files are still in temp location
-$drcovLogDir = $request.drio_log_dir
+# Use the directory path from trace_request where drrun actually wrote the files.
+$drcovLogDir = if ($request.drio_log_dir) {
+    [string]$request.drio_log_dir
+} else {
+    Join-Path (Split-Path -Parent $OutputPath) "drio"
+}
 
 # Diagnostic logging to artifact directory so it gets copied to report
 $diagLog = Join-Path (Split-Path -Parent $OutputPath) "trace_backend_diagnostic.txt"

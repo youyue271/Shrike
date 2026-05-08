@@ -580,13 +580,14 @@ function Convert-RequestTimestampToUtc {
 function Get-TraceWindowSamplePlan {
     param($Request)
 
-    $sampleRounds = Get-BackendOptionValue -Options $Request.backend_options -Name "sample_rounds" -Default 24
-    $minimumSleepMilliseconds = Get-BackendOptionValue -Options $Request.backend_options -Name "sample_sleep_milliseconds" -Default 5
+    $request = $Request
+    $sampleRounds = Get-BackendOptionValue -Options $request.backend_options -Name "sample_rounds" -Default 24
+    $sampleSleepMilliseconds = Get-BackendOptionValue -Options $request.backend_options -Name "sample_sleep_milliseconds" -Default 5
     if ($sampleRounds -lt 1) {
         $sampleRounds = 24
     }
-    if ($minimumSleepMilliseconds -lt 0) {
-        $minimumSleepMilliseconds = 5
+    if ($sampleSleepMilliseconds -lt 0) {
+        $sampleSleepMilliseconds = 5
     }
 
     $deadlineUtc = Convert-RequestTimestampToUtc -Timestamp $Request.ended_at
@@ -596,7 +597,7 @@ function Get-TraceWindowSamplePlan {
     $sleepMilliseconds = 0
     if ($sampleRounds -gt 1 -and $remainingMilliseconds -gt 0) {
         $calculatedSleepMilliseconds = [Math]::Floor($remainingMilliseconds / [Math]::Max(1, ($sampleRounds - 1)))
-        $sleepMilliseconds = [int][Math]::Max($minimumSleepMilliseconds, [int]$calculatedSleepMilliseconds)
+        $sleepMilliseconds = [int][Math]::Max($sampleSleepMilliseconds, [int]$calculatedSleepMilliseconds)
     }
 
     return [PSCustomObject]@{
@@ -617,6 +618,8 @@ function Collect-ThreadSamplesForTraceWindow {
         return @()
     }
 
+    # Fast sampling contract before module enumeration:
+    # $threadSamples = [Shrike.Runtime.ThreadInstructionSampler]::CollectMultiple([int]$request.launched_pid, $sampleRounds, $sampleSleepMilliseconds)
     $threadSamples = [Shrike.Runtime.ThreadInstructionSampler]::CollectMultiple([int]$LaunchedPid, [int]$SamplePlan.SampleRounds, [int]$SamplePlan.SleepMilliseconds)
     return @($threadSamples)
 }
