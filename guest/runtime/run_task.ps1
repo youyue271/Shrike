@@ -6,8 +6,7 @@ $executionWindowSeconds = 120
 $mediaWaitTimeoutSeconds = 120
 $mediaPollIntervalSeconds = 3
 $bootStabilizationSeconds = 30
-$resultServerHost = "192.168.100.1"
-$resultServerPort = 42042
+$sampleExitWaitSeconds = 10
 $runnerLogLines = New-Object 'System.Collections.Generic.List[string]'
 $script:TraceBackendScriptContentCache = @{}
 
@@ -99,63 +98,7 @@ function New-TextResultArtifact {
     }
 }
 
-function Send-ResultArtifact {
-    param(
-        [Parameter(Mandatory = $true)]
-        $Artifact,
-
-        [string]$HostName = $resultServerHost,
-        [int]$Port = $resultServerPort,
-        [int]$TimeoutMilliseconds = 1000
-    )
-
-    $client = $null
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $async = $client.BeginConnect($HostName, $Port, $null, $null)
-        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) {
-            throw "connect timeout"
-        }
-        $client.EndConnect($async)
-
-        $contentBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Artifact.Content)
-        $payload = [ordered]@{
-            type = "artifact"
-            name = [string]$Artifact.Name
-            content_base64 = [Convert]::ToBase64String($contentBytes)
-        }
-        $line = ($payload | ConvertTo-Json -Compress -Depth 5) + "`n"
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
-        $stream = $client.GetStream()
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush()
-        Write-RunnerLog ("streamed result artifact {0}" -f $Artifact.Name)
-        return $true
-    } catch {
-        Write-RunnerLog ("stream result artifact failed name={0}: {1}" -f $Artifact.Name, $_.Exception.Message)
-        return $false
-    } finally {
-        if ($client) {
-            $client.Close()
-        }
-    }
-}
-
-function Send-PreExecutionArtifacts {
-    param([array]$Artifacts)
-
-    $deferred = @()
-    foreach ($artifact in @($Artifacts)) {
-        if (-not (Send-ResultArtifact -Artifact $artifact)) {
-            $deferred += $artifact
-        }
-    }
-
-    Write-RunnerLog ("deferred {0} of {1} pre-execution artifacts for post-execution publication" -f @($deferred).Count, @($Artifacts).Count)
-    return @($deferred)
-}
-
-function Write-DeferredResultArtifacts {
+function Write-BufferedResultArtifacts {
     param(
         [array]$Artifacts,
         [string]$ArtifactDir
@@ -164,7 +107,7 @@ function Write-DeferredResultArtifacts {
     foreach ($artifact in @($Artifacts)) {
         $path = Join-Path $ArtifactDir ([string]$artifact.Name)
         Set-Content -Path $path -Value ([string]$artifact.Content) -Encoding UTF8
-        Write-RunnerLog ("materialized deferred result artifact {0}" -f $artifact.Name)
+        Write-RunnerLog ("materialized buffered result artifact {0}" -f $artifact.Name)
     }
 }
 
@@ -588,6 +531,61 @@ function Stop-TraceLauncherProcessTree {
     Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId
     Start-Sleep -Seconds 5
     Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId -Force
+}
+
+function Wait-ProcessExit {
+    param(
+        [int]$ProcessId,
+        [int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if (-not $proc -or $proc.HasExited) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    return (-not $proc -or $proc.HasExited)
+}
+
+function Stop-SampleProcessTree {
+    param(
+        [int]$LauncherProcessId,
+        [string]$SampleName = $null,
+        [int]$ExitWaitSeconds = 10
+    )
+
+    try {
+        $sampleProc = Get-Process -Id $LauncherProcessId -ErrorAction SilentlyContinue
+        if ($sampleProc -and -not $sampleProc.HasExited) {
+            $sampleProc.Kill()
+            Write-RunnerLog ("killed sample process pid={0}" -f $LauncherProcessId)
+        }
+    } catch {}
+
+    try {
+        Get-Process | Where-Object { $_.Path -and $_.Path -like "*\Sandbox\input\*" } | ForEach-Object {
+            $_.Kill()
+            Write-RunnerLog ("killed child process pid={0} path={1}" -f $_.Id, $_.Path)
+        }
+    } catch {}
+
+    Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId -Force
+
+    $exited = Wait-ProcessExit -ProcessId $LauncherProcessId -TimeoutSeconds $ExitWaitSeconds
+    if (-not $exited) {
+        Write-RunnerLog ("sample process tree did not exit within {0}s; retrying force kill" -f $ExitWaitSeconds)
+        Invoke-TraceTreeTaskkill -LauncherProcessId $LauncherProcessId -Force
+        $exited = Wait-ProcessExit -ProcessId $LauncherProcessId -TimeoutSeconds 3
+    }
+    if ($exited) {
+        Write-RunnerLog "sample process tree terminated"
+    } else {
+        Write-RunnerLog "sample process tree still reachable after force kill; proceeding anyway"
+    }
 }
 
 function Remove-InvalidXmlChars {
@@ -1086,15 +1084,6 @@ try {
 
     Wait-ForBootStabilization -Seconds $bootStabilizationSeconds
 
-    # Configure network for ResultServer communication (non-fatal)
-    Write-RunnerLog "configuring network for ResultServer"
-    try {
-        & "$PSScriptRoot\configure_network.ps1" -ErrorAction SilentlyContinue
-        Write-RunnerLog "network configuration completed"
-    } catch {
-        Write-RunnerLog "network configuration skipped: $_"
-    }
-
     $sampleDir = Join-Path $sampleDrive "sample"
     $artifactDir = Join-Path $artifactDrive "artifact"
     $stagingDir = Join-Path $localOutputRoot "staging"
@@ -1110,7 +1099,7 @@ try {
     Get-ChildItem -Path $localInput -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
     $preExecutionArtifacts = New-SnapshotBundleArtifacts -Prefix "pre"
-    $deferredResultArtifacts = Send-PreExecutionArtifacts -Artifacts $preExecutionArtifacts
+    $bufferedResultArtifacts = @($preExecutionArtifacts)
 
     Get-ChildItem $sampleDir | Copy-Item -Destination $localInput -Force
     Write-RunnerLog "copied sample to local input"
@@ -1234,21 +1223,15 @@ try {
         execution_window_seconds = $executionWindowSeconds
     }
     $sampleMetadataArtifact = New-TextResultArtifact -Name "sample_metadata.json" -Content (ConvertTo-JsonText -InputObject $sampleMetadata)
-    if (-not (Send-ResultArtifact -Artifact $sampleMetadataArtifact)) {
-        $deferredResultArtifacts += $sampleMetadataArtifact
-    }
+    $bufferedResultArtifacts += $sampleMetadataArtifact
 
     if ($taskProfile) {
         $taskProfileArtifact = New-TextResultArtifact -Name "task_profile.json" -Content (ConvertTo-JsonText -InputObject $taskProfile)
-        if (-not (Send-ResultArtifact -Artifact $taskProfileArtifact)) {
-            $deferredResultArtifacts += $taskProfileArtifact
-        }
+        $bufferedResultArtifacts += $taskProfileArtifact
     }
 
     $taskRuntimeContextArtifact = New-TextResultArtifact -Name "task_runtime_context.json" -Content (ConvertTo-JsonText -InputObject $taskRuntimeContext)
-    if (-not (Send-ResultArtifact -Artifact $taskRuntimeContextArtifact)) {
-        $deferredResultArtifacts += $taskRuntimeContextArtifact
-    }
+    $bufferedResultArtifacts += $taskRuntimeContextArtifact
 
     if (-not $deferTraceExport) {
         $traceArtifactBuffer = Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
@@ -1262,23 +1245,12 @@ try {
 
     if ($deferTraceExport) {
         Stop-TraceLauncherProcessTree -LauncherProcessId $proc.Id -SampleName $sample.Name
+        $null = Wait-ProcessExit -ProcessId $proc.Id -TimeoutSeconds $sampleExitWaitSeconds
     } else {
-        try {
-            $sampleProc = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-            if ($sampleProc -and -not $sampleProc.HasExited) {
-                $sampleProc.Kill()
-                Write-RunnerLog ("killed sample process pid={0}" -f $proc.Id)
-            }
-        } catch {}
+        Stop-SampleProcessTree -LauncherProcessId $proc.Id -SampleName $sample.Name -ExitWaitSeconds $sampleExitWaitSeconds
     }
-    try {
-        Get-Process | Where-Object { $_.Path -and $_.Path -like "*\Sandbox\input\*" } | ForEach-Object {
-            $_.Kill()
-            Write-RunnerLog ("killed child process pid={0} path={1}" -f $_.Id, $_.Path)
-        }
-    } catch {}
 
-    Write-DeferredResultArtifacts -Artifacts $deferredResultArtifacts -ArtifactDir $stagingDir
+    Write-BufferedResultArtifacts -Artifacts $bufferedResultArtifacts -ArtifactDir $stagingDir
 
     if (-not $deferTraceExport) {
         Write-TraceArtifactBuffer -TraceArtifactBuffer $traceArtifactBuffer -ArtifactDir $artifactDir

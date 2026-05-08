@@ -142,11 +142,11 @@ The sandbox implements several anti-analysis evasion techniques:
 - **Impact**: `sandbox/scripts/analyze_sample.py` may fail because it invokes Windows PowerShell from a Python child process.
 - **Workaround**: use the top-level wrapper `windows_host/powershell/12_run_sandbox_wrapped.ps1`, which keeps Windows orchestration inside a single PowerShell process and only calls WSL for ISO build/report parsing.
 
-#### 5. Result Artifact Staging (MITIGATED 2026-05-07)
+#### 5. Result Artifact Staging (MITIGATED 2026-05-08)
 - **Issue**: pre-execution sandbox artifacts written under `C:\Sandbox\output\staging` were visible to ransomware during the execution window and could be encrypted as `.xb7n5`.
-- **Mitigation**: small pre-execution artifacts now use the host ResultServer artifact channel first. The guest sends `pre` snapshots, `sample_metadata.json`, `task_profile.json`, and `task_runtime_context.json` over TCP to the host before or during launch instead of writing them directly to staging.
-- **Fallback**: if the ResultServer channel is unavailable, those artifacts are deferred and materialized to staging only after the sample execution window ends and the sample process is terminated.
-- **Host merge**: `analyze_sample.py`, `collect_report.py`, and `windows_host/powershell/12_run_sandbox_wrapped.ps1` merge `tmp/result_server_artifacts` into the mounted artifact staging directory before parsing.
+- **Mitigation**: small pre-execution artifacts (pre-run snapshots, `sample_metadata.json`, `task_profile.json`, `task_runtime_context.json`) are now captured in memory before launch and only materialized to staging after the sample process tree has been force-terminated.
+- **Process shutdown**: `Stop-SampleProcessTree` kills the launcher, any descendant under `C:\Sandbox\input\*`, runs `taskkill /T /F`, then waits up to 10 seconds for actual exit before flushing the buffer. This closes the window where a still-running ransomware process could see the buffered artifacts as they land.
+- **Why not a network channel**: an earlier prototype streamed artifacts to a host `ResultServer` over TCP, but analysis VMs have no NIC by design (`02_new_analysis_vm.ps1` removes all adapters for air-gap). Rebuilding that channel would require an internal vSwitch, a NIC on every VM, firewall rules, and a snapshot refresh, all of which would also add a visible fingerprint to VM-aware malware. The in-memory buffer preserves the air-gap and has fewer moving parts.
 
 #### 6. Hyper-V Detection
 - **Issue**: VM-aware malware can detect Hyper-V environment
@@ -353,7 +353,7 @@ python sandbox/scripts/install_drio_runtime.py
 
 #### Current Snapshot Backup
 
-Before enabling the ResultServer artifact-channel runtime and refreshing the sandbox baseline, the existing checkpoints were exported:
+Before enabling the in-memory buffered artifact runtime and refreshing the sandbox baseline, the existing checkpoints were exported:
 
 - **Backup time**: `2026-05-07 16:14:50`
 - **VM**: `rw-sandbox-win10`

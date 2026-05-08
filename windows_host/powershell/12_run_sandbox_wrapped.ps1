@@ -99,11 +99,6 @@ $sampleWsl = Convert-WindowsPathToWsl -Path $sample
 $taskProfileWsl = Convert-WindowsPathToWsl -Path $taskProfilePath
 $sampleIsoWsl = Convert-WindowsPathToWsl -Path $sampleIso
 $artifactStagingWsl = Convert-WindowsPathToWsl -Path $artifactStaging
-$resultServerScript = Join-Path $repoRoot "sandbox\scripts\result_server.py"
-$resultServerArtifactDir = Join-Path $repoRoot "tmp\result_server_artifacts"
-$resultServerStdout = Join-Path $repoRoot "tmp\result_server.stdout.log"
-$resultServerStderr = Join-Path $repoRoot "tmp\result_server.stderr.log"
-
 $newArtifactScript = Join-Path $repoRoot "windows_host\powershell\03_new_artifact_disk.ps1"
 $invokeTaskScript = Join-Path $repoRoot "windows_host\powershell\04_invoke_offline_task.ps1"
 $mountArtifactScript = Join-Path $repoRoot "windows_host\powershell\05_mount_artifact_disk.ps1"
@@ -118,15 +113,12 @@ if ($DryRun) {
     Write-Host ""
     Write-Host "Dry run resolved successfully."
     Write-Host ("Build ISO: wsl.exe -e {0} {1} {2} --output {3} --task-profile {4}" -f $pythonWsl, $buildIsoWsl, $sampleWsl, $sampleIsoWsl, $taskProfileWsl)
-    Write-Host ("Start ResultServer: <windows-python> {0} --host 192.168.100.1 --port 42042 --output-dir {1}" -f $resultServerScript, $resultServerArtifactDir)
     Write-Host ("Invoke VM: {0} -VmName {1} -SnapshotName {2} -SampleIsoPath {3} -ArtifactDiskPath {4} -TimeoutSeconds {5}" -f $invokeTaskScript, $VmName, $SnapshotName, $sampleIso, $artifactDisk, $TimeoutSeconds)
-    Write-Host ("Merge ResultServer artifacts: {0} -> {1}" -f $resultServerArtifactDir, $artifactStaging)
     Write-Host ("Parse: wsl.exe -e {0} {1} {2}" -f $pythonWsl, $parseArtifactWsl, $artifactStagingWsl)
     exit 0
 }
 
 $mounted = $false
-$resultServerProcess = $null
 try {
     if (-not (Test-Path $sample)) {
         throw "Sample not found: $sample"
@@ -141,36 +133,6 @@ try {
 
     Invoke-Checked -Label "Create artifact VHDX" -Command {
         & $newArtifactScript -ArtifactDiskPath $artifactDisk
-    }
-
-    if (Test-Path $resultServerArtifactDir) {
-        Remove-Item -Path $resultServerArtifactDir -Recurse -Force
-    }
-    New-Item -ItemType Directory -Force -Path $resultServerArtifactDir | Out-Null
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $resultServerStdout) | Out-Null
-
-    try {
-        $windowsPython = Resolve-WindowsPython
-        $resultServerArgs = @(
-            $resultServerScript,
-            "--host", "192.168.100.1",
-            "--port", "42042",
-            "--output-dir", $resultServerArtifactDir
-        )
-        $resultServerProcess = Start-Process `
-            -FilePath $windowsPython `
-            -ArgumentList $resultServerArgs `
-            -PassThru `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $resultServerStdout `
-            -RedirectStandardError $resultServerStderr
-        Start-Sleep -Seconds 1
-        if ($resultServerProcess.HasExited) {
-            Write-Warning ("ResultServer exited early with code {0}; guest runtime will defer pre-execution artifacts." -f $resultServerProcess.ExitCode)
-            $resultServerProcess = $null
-        }
-    } catch {
-        Write-Warning ("ResultServer startup failed; guest runtime will defer pre-execution artifacts: {0}" -f $_.Exception.Message)
     }
 
     Invoke-Checked -Label "Run offline Hyper-V task" -Command {
@@ -200,11 +162,6 @@ try {
     Write-Host ""
     Write-Host "==> Copy artifact files"
     Invoke-RobocopyChecked -Source $artifactPath -Destination $artifactStaging
-    if (Test-Path $resultServerArtifactDir) {
-        Write-Host ""
-        Write-Host "==> Merge ResultServer artifacts"
-        Invoke-RobocopyChecked -Source $resultServerArtifactDir -Destination $artifactStaging
-    }
     if (-not $SkipParse) {
         $parseArgs = @("-e", $pythonWsl, $parseArtifactWsl, $artifactStagingWsl)
         if ($ReportId) {
@@ -225,9 +182,6 @@ try {
     }
     Write-Host ("Log file: {0}" -f $logPath)
 } finally {
-    if ($resultServerProcess -and -not $resultServerProcess.HasExited) {
-        Stop-Process -Id $resultServerProcess.Id -Force -ErrorAction SilentlyContinue
-    }
     if ($mounted) {
         Dismount-VHD -Path $artifactDisk -ErrorAction SilentlyContinue
     }

@@ -600,25 +600,33 @@ class GuestRuntimeTraceTimingTests(unittest.TestCase):
         self.assertLess(script.index(trace_export), script.index(publish_trace))
         self.assertLess(script.index(publish_trace), script.index(sysmon_export))
 
-    def test_run_task_streams_pre_execution_artifacts_before_sample_launch_without_staging_writes(self) -> None:
+    def test_run_task_buffers_pre_execution_artifacts_before_sample_launch_without_staging_writes(self) -> None:
         script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
         before_launch = script[: script.index('Write-RunnerLog ("launching sample {0}" -f $sample.FullName)')]
 
-        self.assertIn("Send-PreExecutionArtifacts -Artifacts $preExecutionArtifacts", before_launch)
-        self.assertIn("Send-ResultArtifact -Artifact $artifact", script)
+        self.assertIn('$bufferedResultArtifacts = @($preExecutionArtifacts)', before_launch)
         self.assertNotIn('Export-SnapshotBundle -Prefix "pre" -ArtifactDir $stagingDir', before_launch)
         self.assertNotIn('Join-Path $stagingDir "sample_metadata.json"', before_launch)
         self.assertNotIn('Join-Path $stagingDir "task_profile.json"', before_launch)
         self.assertNotIn('Join-Path $stagingDir "task_runtime_context.json"', before_launch)
 
-    def test_run_task_materializes_deferred_pre_execution_artifacts_after_sample_shutdown(self) -> None:
+    def test_run_task_materializes_buffered_pre_execution_artifacts_after_sample_shutdown(self) -> None:
         script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Write-DeferredResultArtifacts -Artifacts $deferredResultArtifacts -ArtifactDir $stagingDir", script)
+        self.assertIn("Write-BufferedResultArtifacts -Artifacts $bufferedResultArtifacts -ArtifactDir $stagingDir", script)
         self.assertLess(
             script.index('Write-RunnerLog "execution window ended"'),
-            script.index("Write-DeferredResultArtifacts -Artifacts $deferredResultArtifacts -ArtifactDir $stagingDir"),
+            script.index("Write-BufferedResultArtifacts -Artifacts $bufferedResultArtifacts -ArtifactDir $stagingDir"),
         )
+
+    def test_run_task_waits_for_sample_process_exit_before_materializing_buffer(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertLess(
+            script.index("Stop-SampleProcessTree -LauncherProcessId $proc.Id"),
+            script.index("Write-BufferedResultArtifacts -Artifacts $bufferedResultArtifacts -ArtifactDir $stagingDir"),
+        )
+        self.assertIn("Wait-ProcessExit -ProcessId $LauncherProcessId -TimeoutSeconds $ExitWaitSeconds", script)
 
     def test_run_task_launches_extensionless_drio_samples_via_exe_copy(self) -> None:
         script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
@@ -909,36 +917,6 @@ class OfflineTaskTimeoutBudgetTests(unittest.TestCase):
 
         self.assertIn("if args.timeout_seconds is not None:", script)
         self.assertIn('run_cmd.extend(["--timeout-seconds", str(args.timeout_seconds)])', script)
-
-    def test_collect_report_can_merge_result_server_artifacts_before_parse(self) -> None:
-        script = (REPO_ROOT / "sandbox" / "scripts" / "collect_report.py").read_text(encoding="utf-8")
-
-        self.assertIn("--merge-artifact-dir", script)
-        self.assertIn("merge_artifact_dir", script)
-        self.assertLess(
-            script.index("copy_result = run_capture(copy_cmd)"),
-            script.index("if args.merge_artifact_dir:"),
-        )
-        self.assertLess(
-            script.index("if args.merge_artifact_dir:"),
-            script.index("parse_cmd = [sys.executable, str(parse_script), str(staging_dir)]"),
-        )
-
-    def test_analyze_sample_cleans_and_merges_result_server_artifacts(self) -> None:
-        script = (REPO_ROOT / "sandbox" / "scripts" / "analyze_sample.py").read_text(encoding="utf-8")
-
-        self.assertIn("shutil.rmtree(result_server_output_dir)", script)
-        self.assertIn('collect_cmd.extend(["--merge-artifact-dir", str(result_server_output_dir)])', script)
-
-    def test_windows_wrapper_starts_and_merges_result_server_artifacts(self) -> None:
-        script = (REPO_ROOT / "windows_host" / "powershell" / "12_run_sandbox_wrapped.ps1").read_text(encoding="utf-8")
-
-        self.assertIn("$resultServerScript = Join-Path $repoRoot", script)
-        self.assertIn("$windowsPython = Resolve-WindowsPython", script)
-        self.assertIn("$resultServerProcess = Start-Process", script)
-        self.assertIn('"--port", "42042"', script)
-        self.assertIn('Invoke-RobocopyChecked -Source $resultServerArtifactDir -Destination $artifactStaging', script)
-        self.assertIn("Stop-Process -Id $resultServerProcess.Id", script)
 
 
 class RawArtifactCopyTests(unittest.TestCase):
