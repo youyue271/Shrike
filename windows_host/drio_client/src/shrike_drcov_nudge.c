@@ -13,9 +13,6 @@
 #ifdef WINDOWS
 #include <windows.h>
 #include <intrin.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
 
 typedef struct _UNICODE_STRING {
     USHORT Length;
@@ -93,10 +90,6 @@ typedef struct _per_thread_t {
     uint buffer_pos;
     file_t log_file;
     uint64 event_count;
-#ifdef WINDOWS
-    SOCKET result_socket;
-    bool result_socket_disabled;
-#endif
 } per_thread_t;
 
 static bool g_initialized;
@@ -117,8 +110,6 @@ static char g_sample_path[SAMPLE_PATH_CAP];
 static app_pc g_dynamic_exec_region_base[MAX_DYNAMIC_EXEC_REGIONS];
 static app_pc g_dynamic_exec_region_end[MAX_DYNAMIC_EXEC_REGIONS];
 static int g_dynamic_exec_region_count;
-static const char *g_result_server_host;
-static int g_result_server_port;
 
 #ifndef BUILD_ID
 #define BUILD_ID "unknown"
@@ -149,36 +140,6 @@ has_client_option(int argc, const char *argv[], const char *name)
     }
     return false;
 }
-
-#ifdef WINDOWS
-static SOCKET
-connect_to_result_server(const char *host, int port)
-{
-    SOCKET sock;
-    struct sockaddr_in server_addr;
-    WSADATA wsa_data;
-
-    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-        return INVALID_SOCKET;
-    }
-
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        return INVALID_SOCKET;
-    }
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons((u_short)port);
-    server_addr.sin_addr.s_addr = inet_addr(host);
-
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-        closesocket(sock);
-        return INVALID_SOCKET;
-    }
-
-    return sock;
-}
-#endif
 
 static void json_escape_string(const char *src, char *dst, size_t dst_size);
 
@@ -592,61 +553,6 @@ flush_trace_buffer(void *drcontext, per_thread_t *data)
 
     tid = dr_get_thread_id(drcontext);
 
-#ifdef WINDOWS
-    /* Use socket if result server is configured */
-    if (g_result_server_host && g_result_server_port > 0 && !data->result_socket_disabled) {
-        if (data->result_socket == INVALID_SOCKET) {
-            data->result_socket = connect_to_result_server(g_result_server_host, g_result_server_port);
-            if (data->result_socket == INVALID_SOCKET) {
-                data->result_socket_disabled = true;
-            }
-        }
-
-        if (data->result_socket != INVALID_SOCKET) {
-            for (i = 0; i < data->buffer_pos; i++) {
-                trace_event_t *event = &data->buffer[i];
-                const char *event_name = NULL;
-                char buf[512];
-                int len;
-
-                switch (event->event_type) {
-                    case EVENT_CALL:
-                        event_name = "call";
-                        break;
-                    case EVENT_RET:
-                        event_name = "return";
-                        break;
-                    case EVENT_INDIRECT_JUMP:
-                        event_name = "indirect_jump";
-                        break;
-                    case EVENT_INDIRECT_CALL:
-                        event_name = "indirect_call";
-                        break;
-                    default:
-                        event_name = "unknown";
-                        break;
-                }
-
-                len = dr_snprintf(buf, sizeof(buf),
-                                 "{\"event\":\"%s\",\"tid\":%u,\"src\":\"0x%llx\",\"target\":\"0x%llx\",\"ts\":%llu}\n",
-                                 event_name,
-                                 event->thread_id,
-                                 (unsigned long long)event->source,
-                                 (unsigned long long)event->target,
-                                 (unsigned long long)event->timestamp);
-
-                if (len > 0 && len < sizeof(buf)) {
-                    send(data->result_socket, buf, len, 0);
-                }
-            }
-
-            data->buffer_pos = 0;
-            return;
-        }
-    }
-#endif
-
-    /* Fallback to file if socket not available */
     char filename[256];
     dr_snprintf(filename, sizeof(filename), "%s/%s.%05d.ndjson",
                g_logdir ? g_logdir : ".",
@@ -946,10 +852,6 @@ event_thread_init(void *drcontext)
     data->buffer_pos = 0;
     data->log_file = INVALID_FILE;
     data->event_count = 0;
-#ifdef WINDOWS
-    data->result_socket = INVALID_SOCKET;
-    data->result_socket_disabled = false;
-#endif
 
     drmgr_set_tls_field(drcontext, tls_idx, data);
 
@@ -983,12 +885,6 @@ event_thread_exit(void *drcontext)
 
     if (data) {
         flush_trace_buffer(drcontext, data);
-
-#ifdef WINDOWS
-        if (data->result_socket != INVALID_SOCKET) {
-            closesocket(data->result_socket);
-        }
-#endif
 
         if (data->log_file != INVALID_FILE) {
 #ifdef WINDOWS
@@ -2187,18 +2083,6 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     g_dump_text = has_client_option(argc, argv, "-dump_text");
     g_bypass_antidebug = has_client_option(argc, argv, "-bypass_antidebug");
     g_enable_peb_unlinking = has_client_option(argc, argv, "-enable_peb_unlinking");
-    g_result_server_host = get_client_option(argc, argv, "-result_server_host");
-
-    {
-        const char *port_str = get_client_option(argc, argv, "-result_server_port");
-        g_result_server_port = 0;
-        if (port_str) {
-            int i;
-            for (i = 0; port_str[i] >= '0' && port_str[i] <= '9'; i++) {
-                g_result_server_port = g_result_server_port * 10 + (port_str[i] - '0');
-            }
-        }
-    }
 
     if (!drmgr_init()) {
         dr_fprintf(STDERR, "shrike_cfg_tracer: drmgr_init failed\n");

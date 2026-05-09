@@ -38,7 +38,7 @@ Shrike supports multiple trace backends for dynamic analysis:
 ### DynamoRIO Backend (`drio`)
 - Uses DynamoRIO with custom `drcov` client for basic block coverage
 - Captures control flow graph (CFG) with basic blocks and edges
-- Supports both 32-bit and 64-bit samples
+- Supports both 32-bit and 64-bit samples, but the DynamoRIO runner and client bitness must match the sample bitness
 - Custom client DLL: `shrike_drcov_nudge.dll`
 - Provides detailed execution traces in `dynamic_cfg_trace.ndjson`
 
@@ -148,7 +148,27 @@ The sandbox implements several anti-analysis evasion techniques:
 - **Process shutdown**: `Stop-SampleProcessTree` kills the launcher, any descendant under `C:\Sandbox\input\*`, runs `taskkill /T /F`, then waits up to 10 seconds for actual exit before flushing the buffer. This closes the window where a still-running ransomware process could see the buffered artifacts as they land.
 - **Why not a network channel**: an earlier prototype streamed artifacts to a host `ResultServer` over TCP, but analysis VMs have no NIC by design (`02_new_analysis_vm.ps1` removes all adapters for air-gap). Rebuilding that channel would require an internal vSwitch, a NIC on every VM, firewall rules, and a snapshot refresh, all of which would also add a visible fingerprint to VM-aware malware. The in-memory buffer preserves the air-gap and has fewer moving parts.
 
-#### 6. Hyper-V Detection
+#### 6. DynamoRIO Client Bitness and Loader Compatibility (RESOLVED 2026-05-09)
+- **Bitness rule**: a 64-bit DynamoRIO client cannot run a 32-bit sample. 32-bit samples must use `bin32\drrun.exe` with the 32-bit client (`-c32`); 64-bit samples must use `bin64\drrun.exe` with the 64-bit client (`-c64`).
+- **What the previous working run proved**: the validated sample `8C716101E118AC65D7BDB900E0100D012256ABB1D7CDF64830E5943A795CCCE2` is PE32, so that run validated the 32-bit path only.
+- **Resolved root cause**: VS 2022/v143-built DynamoRIO clients using the default CRT/libc startup path fail in DynamoRIO 10's private Windows client loader with `Unable to load client library: ... library initializer failed`. The same failure reproduces with the official `empty.c` sample rebuilt locally, while the stock prebuilt `empty.dll` works.
+- **Fix**: `windows_host/powershell/11_build_drio_nudge_client.ps1` now builds the client with `DynamoRIO_USE_LIBC OFF` and the compatibility linker flags `/SUBSYSTEM:CONSOLE,5.02 /OSVERSION:5.02 /GUARD:NO`.
+- **Verification**: host and guest direct `drrun` smoke tests now load the custom client for both `bin64`/`-c64` and `bin32`/`-c32`. Batch smoke results also completed with `trace_status=control_flow_trace` for PE32+ sample `0789a9c0...` and PE32 sample `8c716...`.
+
+#### 7. Batch Runner and Current Validation (VALIDATED 2026-05-09)
+- **Batch runner**: `windows_host\powershell\13_batch_sandbox_wrapped.ps1` keeps orchestration inside Windows PowerShell, walks a sample tree recursively, skips IDA sidecar files, retries once after VM cleanup, writes `batch_manifest.jsonl` / `batch_errors.jsonl`, and copies only whitelisted analysis artifacts into the results directory.
+- **Health gate**: a batch item is accepted only when the parsed trace manifest reports `control_flow_trace` or `completed`. Placeholder-only `seeded_from_runtime_metadata` output is treated as failure, so a run cannot pass just because parsing seeded the PE entry point.
+- **DRIO launch hardening**: guest runtime now selects matching `drrun` and client bitness, adds DynamoRIO runtime and extension library directories to `PATH`, uses `drconfig.exe -nudge`, and records whether `-bypass_antidebug` remained effective.
+- **Smoke batch evidence**: six Quantum-family samples under `results_quantum_batch_test/` completed with real `control_flow_trace` output:
+  - `0789a9c0a0d4`: 173416 trace events, 2324 basic blocks, 3778 edges
+  - `0f3bb820adf6`: 173497 trace events, 2324 basic blocks, 3778 edges
+  - `2fd8356abd42`: 173568 trace events, 2324 basic blocks, 3769 edges
+  - `511c1021fad7`: 175119 trace events, 2403 basic blocks, 3965 edges
+  - `834c1dc19baf`: 83413 trace events, 307 basic blocks, 613 edges
+  - `b63e94928da2`: 83413 trace events, 307 basic blocks, 613 edges
+- **Operational note**: generated raw result directories can be large (`results_quantum_batch_test/` was about 831 MB for six smoke samples). Keep README and manifest summaries in git unless raw artifacts are explicitly needed.
+
+#### 8. Hyper-V Detection
 - **Issue**: VM-aware malware can detect Hyper-V environment
 - **Mitigation**: Minimal VM fingerprints, but hardware-level detection remains possible
 - **Future**: Consider Intel PT for hardware-level tracing (no software artifacts)
@@ -292,6 +312,21 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass \
 
 The parsed report is written under `reports/<sample_hash>_<timestamp>/`.
 
+For batch runs on this host, prefer the top-level PowerShell batch wrapper so Windows orchestration stays inside a Windows process:
+
+```bash
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File 'D:\project\ransomware\method12-dev\windows_host\powershell\13_batch_sandbox_wrapped.ps1' \
+  -SamplesDir 'D:\project\ransomware\baseline\local_executable_files\Executable Files\Ransomware' \
+  -TaskProfile 'sandbox\profiles\deep_cfg_drio_extended.json' \
+  -ResultsDir 'results' \
+  -TimeoutSeconds 600
+```
+
+For a smoke batch, add `-Limit 6` and optionally set a scratch results directory such as `-ResultsDir 'results_quantum_batch_test'`. For the full ransomware corpus, omit `-Limit`.
+
+The Python batch runner remains useful on hosts where WSL child-process PowerShell interop is reliable, but this machine should use `13_batch_sandbox_wrapped.ps1`.
+
 ### 5. Inspect results
 
 ```bash
@@ -326,6 +361,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass \
   -SamplePath '<sample_path>' \
   -TaskProfile 'sandbox\profiles\deep_cfg_drio_extended.json' \
   -ReportId '<report_id>' \
+  -TimeoutSeconds 600
+
+# Batch workaround wrapper for WSL/Python interop failures
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File 'D:\project\ransomware\method12-dev\windows_host\powershell\13_batch_sandbox_wrapped.ps1' \
+  -SamplesDir '<samples_dir>' \
+  -TaskProfile 'sandbox\profiles\deep_cfg_drio_extended.json' \
+  -ResultsDir 'results' \
   -TimeoutSeconds 600
 ```
 
@@ -421,6 +464,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass \
   -File 'D:\project\ransomware\method12-dev\windows_host\powershell\12_run_sandbox_wrapped.ps1' \
   -ReportId 'drio_extended_8c716101_manual'
 ```
+
+For batch mode, use `windows_host\powershell\13_batch_sandbox_wrapped.ps1` rather than `sandbox/scripts/batch_analyze.py` on this host.
 
 ## Scope
 

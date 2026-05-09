@@ -32,6 +32,30 @@ function Get-VcVarsAllPath {
     return $vcvarsallPath
 }
 
+function Get-CMakePath {
+    $cmakeCommand = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    if ($cmakeCommand) {
+        return $cmakeCommand.Source
+    }
+
+    $vswherePath = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswherePath)) {
+        throw "vswhere.exe not found under the default Visual Studio Installer path."
+    }
+
+    $installationPath = & $vswherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $installationPath) {
+        throw "Visual Studio Build Tools with VC x86/x64 components were not found."
+    }
+
+    $cmakePath = Join-Path $installationPath "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+    if (-not (Test-Path $cmakePath)) {
+        throw "cmake.exe not found in PATH or Visual Studio Build Tools: $cmakePath"
+    }
+
+    return $cmakePath
+}
+
 function Expand-DynamoRIOPackage {
     param(
         [string]$PackagePath,
@@ -53,46 +77,77 @@ function Expand-DynamoRIOPackage {
     return $TempRoot
 }
 
-function Invoke-MsvcClientBuild {
+function Invoke-CMakeClientBuild {
     param(
         [string]$VcVarsAllPath,
+        [string]$CMakePath,
         [string]$Arch,
         [string]$DrRoot,
         [string]$SourcePath,
         [string]$OutputDllPath,
-        [string]$CommandPath,
+        [string]$BuildRoot,
         [string]$LogPath,
         [string]$BuildId
     )
 
-    $libSuffix = if ($Arch -eq "x86") { "lib32" } else { "lib64" }
-    $includeDir = Join-Path $DrRoot "include"
-    $extIncludeDir = Join-Path $DrRoot "ext\include"
-    $dynamorioLib = Join-Path $DrRoot ("{0}\release\dynamorio.lib" -f $libSuffix)
-    $drmgrLib = Join-Path $DrRoot ("ext\{0}\release\drmgr.lib" -f $libSuffix)
-    $drutilLib = Join-Path $DrRoot ("ext\{0}\release\drutil.lib" -f $libSuffix)
-    $drwrapLib = Join-Path $DrRoot ("ext\{0}\release\drwrap.lib" -f $libSuffix)
     $outputDir = Split-Path -Parent $OutputDllPath
-    $outputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($OutputDllPath)
-    $objectPath = Join-Path $outputDir ("{0}.obj" -f $outputBaseName)
     $machine = if ($Arch -eq "x86") { "x86" } else { "x64" }
-    $archDefine = if ($Arch -eq "x86") { "X86_32" } else { "X86_64" }
+    $platformName = if ($Arch -eq "x86") { "Win32" } else { "x64" }
+    $sourceDir = Join-Path $BuildRoot ("src_{0}" -f $Arch)
+    $binaryDir = Join-Path $BuildRoot ("build_{0}" -f $Arch)
+    $cmakeListsPath = Join-Path $sourceDir "CMakeLists.txt"
+    $commandPath = Join-Path $BuildRoot ("build_{0}.cmd" -f $Arch)
 
     New-Item -ItemType Directory -Force $outputDir | Out-Null
+    New-Item -ItemType Directory -Force $sourceDir | Out-Null
+    if (Test-Path $binaryDir) {
+        Remove-Item -Path $binaryDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force $binaryDir | Out-Null
+
+    $cmakeLists = @(
+        "cmake_minimum_required(VERSION 3.14)",
+        "project(shrike_drcov_nudge C CXX)",
+        'set(CMAKE_CONFIGURATION_TYPES "RelWithDebInfo" CACHE STRING "" FORCE)',
+        "set(DynamoRIO_USE_LIBC OFF)",
+        "set(DynamoRIO_DIR ""$((Join-Path $DrRoot "cmake").Replace("\", "/"))"")",
+        "set(PREFERRED_BASE 0x72000000)",
+        "find_package(DynamoRIO REQUIRED)",
+        "configure_DynamoRIO_global(OFF ON)",
+        'set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /GS- /wd4100 /wd4127 /wd4054")',
+        'set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS- /wd4100 /wd4127 /wd4054")',
+        "add_definitions(-D_CRT_SECURE_NO_WARNINGS)",
+        "include_directories(""$((Join-Path $DrRoot "ext\include").Replace("\", "/"))"")",
+        "add_library(shrike_drcov_nudge SHARED ""$($SourcePath.Replace("\", "/"))"")",
+        "target_compile_definitions(shrike_drcov_nudge PRIVATE BUILD_ID=""$BuildId"")",
+        "configure_DynamoRIO_client(shrike_drcov_nudge)",
+        "use_DynamoRIO_extension(shrike_drcov_nudge drmgr)",
+        "use_DynamoRIO_extension(shrike_drcov_nudge drutil)",
+        "use_DynamoRIO_extension(shrike_drcov_nudge drwrap)",
+        'set_property(TARGET shrike_drcov_nudge APPEND_STRING PROPERTY LINK_FLAGS " /SUBSYSTEM:CONSOLE,5.02 /OSVERSION:5.02 /GUARD:NO")',
+        "set_target_properties(shrike_drcov_nudge PROPERTIES RUNTIME_OUTPUT_DIRECTORY ""$($outputDir.Replace("\", "/"))"" LIBRARY_OUTPUT_DIRECTORY ""$($outputDir.Replace("\", "/"))"")"
+    )
+    Set-Content -Path $cmakeListsPath -Value ($cmakeLists -join "`r`n") -Encoding ASCII
 
     $commandLines = @(
         "@echo off",
         "setlocal",
         "call ""$VcVarsAllPath"" $machine >nul",
-        "cl.exe /nologo /LD /O2 /MT /DWINDOWS /D$archDefine /DBUILD_ID=\`"$BuildId\`" /I ""$includeDir"" /I ""$extIncludeDir"" /Fo""$objectPath"" /Fe""$OutputDllPath"" ""$SourcePath"" ""$dynamorioLib"" ""$drmgrLib"" ""$drutilLib"" ""$drwrapLib"""
+        ('"{0}" -S "{1}" -B "{2}" -G "Visual Studio 17 2022" -A {3} -DCMAKE_BUILD_TYPE=RelWithDebInfo' -f $CMakePath, $sourceDir, $binaryDir, $platformName),
+        ('"{0}" --build "{1}" --config RelWithDebInfo --target shrike_drcov_nudge' -f $CMakePath, $binaryDir)
     )
-    Set-Content -Path $CommandPath -Value ($commandLines -join "`r`n") -Encoding ASCII
+    Set-Content -Path $commandPath -Value ($commandLines -join "`r`n") -Encoding ASCII
 
-    $buildOutput = & cmd.exe /d /c $CommandPath 2>&1 | Out-String
+    $buildOutput = & cmd.exe /d /c $commandPath 2>&1 | Out-String
     Write-Log -Message ("build arch={0} output={1}" -f $Arch, $buildOutput.Trim()) -LogPath $LogPath
 
     if ($LASTEXITCODE -ne 0) {
         throw ("MSVC build failed for arch={0}. See log: {1}" -f $Arch, $LogPath)
+    }
+
+    $cmakeOutputDllPath = Join-Path (Join-Path $outputDir "RelWithDebInfo") "shrike_drcov_nudge.dll"
+    if (Test-Path $cmakeOutputDllPath) {
+        Copy-Item -Path $cmakeOutputDllPath -Destination $OutputDllPath -Force
     }
 
     if (-not (Test-Path $OutputDllPath)) {
@@ -117,6 +172,7 @@ try {
     Write-Log -Message ("Build ID: {0}" -f $buildId) -LogPath $logPath
 
     $vcvarsallPath = Get-VcVarsAllPath
+    $cmakePath = Get-CMakePath
     $tempRoot = Join-Path $env:TEMP "shrike-drio-client-build"
     $drRoot = Expand-DynamoRIOPackage -PackagePath $DynamoRIOZipPath -TempRoot (Join-Path $tempRoot "expanded")
 
@@ -131,8 +187,8 @@ try {
         }
     }
 
-    Invoke-MsvcClientBuild -VcVarsAllPath $vcvarsallPath -Arch "x86" -DrRoot $drRoot -SourcePath $ClientSourcePath -OutputDllPath $bin32OutputPath -CommandPath (Join-Path $tempRoot "build_x86.cmd") -LogPath $logPath -BuildId $buildId
-    Invoke-MsvcClientBuild -VcVarsAllPath $vcvarsallPath -Arch "x64" -DrRoot $drRoot -SourcePath $ClientSourcePath -OutputDllPath $bin64OutputPath -CommandPath (Join-Path $tempRoot "build_x64.cmd") -LogPath $logPath -BuildId $buildId
+    Invoke-CMakeClientBuild -VcVarsAllPath $vcvarsallPath -CMakePath $cmakePath -Arch "x86" -DrRoot $drRoot -SourcePath $ClientSourcePath -OutputDllPath $bin32OutputPath -BuildRoot $tempRoot -LogPath $logPath -BuildId $buildId
+    Invoke-CMakeClientBuild -VcVarsAllPath $vcvarsallPath -CMakePath $cmakePath -Arch "x64" -DrRoot $drRoot -SourcePath $ClientSourcePath -OutputDllPath $bin64OutputPath -BuildRoot $tempRoot -LogPath $logPath -BuildId $buildId
 
     $bin32Hash = (Get-FileHash -Path $bin32OutputPath -Algorithm SHA256).Hash
     $bin64Hash = (Get-FileHash -Path $bin64OutputPath -Algorithm SHA256).Hash

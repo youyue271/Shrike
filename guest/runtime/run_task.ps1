@@ -463,11 +463,116 @@ function Get-DrioDrrunPath {
     return "C:\Tools\DynamoRIO\bin64\drrun.exe"
 }
 
+function Get-DrioDrconfigPath {
+    param([string]$DrrunPath)
+
+    if (-not $DrrunPath) {
+        return $null
+    }
+
+    $binDir = Split-Path -Parent $DrrunPath
+    if (-not $binDir) {
+        return $null
+    }
+
+    return (Join-Path $binDir "drconfig.exe")
+}
+
 function Get-DrioClientRuntimePaths {
     return [PSCustomObject]@{
         Bin32 = "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll"
         Bin64 = "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll"
     }
+}
+
+function Get-DrioRuntimePathEntries {
+    param(
+        [string]$DrrunPath,
+        [string]$ClientDll,
+        [bool]$Is32Bit
+    )
+
+    $libSuffix = if ($Is32Bit) { "32" } else { "64" }
+    $drioRoot = $null
+    if ($DrrunPath) {
+        $binDir = Split-Path -Parent $DrrunPath
+        if ($binDir) {
+            $drioRoot = Split-Path -Parent $binDir
+        }
+    }
+
+    $entries = New-Object System.Collections.ArrayList
+    foreach ($path in @(
+        (Split-Path -Parent $DrrunPath),
+        (Split-Path -Parent $ClientDll),
+        (Join-Path $drioRoot ("lib{0}\release" -f $libSuffix)),
+        (Join-Path $drioRoot ("ext\lib{0}\release" -f $libSuffix))
+    )) {
+        if ($path -and (Test-Path $path) -and -not $entries.Contains($path)) {
+            [void]$entries.Add($path)
+        }
+    }
+
+    return @($entries)
+}
+
+function New-DrioTraceArguments {
+    param(
+        [bool]$Is32Bit,
+        [string]$DrioLogDir,
+        [string]$LaunchPath,
+        [bool]$BypassAntidebug
+    )
+
+    $args = if ($Is32Bit) {
+        @("-c32", "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll")
+    } else {
+        @("-c64", "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll")
+    }
+    $args += @(
+        "-dump_text",
+        "-logdir", $DrioLogDir,
+        "-logprefix", "shrike"
+    )
+    if ($BypassAntidebug) {
+        $args += "-bypass_antidebug"
+    }
+    $args += @("--", $LaunchPath)
+    return @($args)
+}
+
+function Start-DrioTraceProcess {
+    param(
+        [string]$DrrunPath,
+        [string[]]$DrrunArgs,
+        [string]$DrrunStdoutPath,
+        [string]$DrrunStderrPath,
+        [string]$DrioRuntimePath
+    )
+
+    $oldPath = $env:PATH
+    try {
+        if ($DrioRuntimePath) {
+            $env:PATH = "$DrioRuntimePath;$oldPath"
+        }
+        return Start-Process -FilePath $DrrunPath -ArgumentList $DrrunArgs -RedirectStandardOutput $DrrunStdoutPath -RedirectStandardError $DrrunStderrPath -PassThru
+    } finally {
+        $env:PATH = $oldPath
+    }
+}
+
+function Test-DrioClientInitializerFailure {
+    param([string]$DrrunStderrPath)
+
+    if (-not (Test-Path $DrrunStderrPath)) {
+        return $false
+    }
+    try {
+        $stderr = Get-Content -Path $DrrunStderrPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch {
+        return $false
+    }
+    return ($stderr -match "library initializer failed")
 }
 
 function Get-DrioNudgeTargetNames {
@@ -493,9 +598,10 @@ function Invoke-DrioNudgeForTraceTargets {
     $targetNames = Get-DrioNudgeTargetNames -SampleName $SampleName
     foreach ($targetName in $targetNames) {
         foreach ($drrunPath in @("C:\Tools\DynamoRIO\bin32\drrun.exe", "C:\Tools\DynamoRIO\bin64\drrun.exe")) {
-            if (Test-Path $drrunPath) {
+            $drconfigPath = Get-DrioDrconfigPath -DrrunPath $drrunPath
+            if ($drconfigPath -and (Test-Path $drconfigPath)) {
                 try {
-                    & $drrunPath "-nudge" $targetName 2>$null | Out-Null
+                    & $drconfigPath "-nudge" $targetName "0" "1" 2>$null | Out-Null
                     Write-RunnerLog ("sent DRIO nudge target={0}" -f $targetName)
                 } catch {
                     Write-RunnerLog ("DRIO nudge failed target={0}: {1}" -f $targetName, $_.Exception.Message)
@@ -1118,6 +1224,7 @@ try {
         user_simulation = Get-TaskProfileValue -TaskProfile $taskProfile -Name "user_simulation" -Default "none"
         profile_name = Get-TaskProfileValue -TaskProfile $taskProfile -Name "profile_name" -Default "default"
     }
+    $bypassAntidebugEffective = $bypassAntidebug
     Write-RunnerLog ("launching sample {0}" -f $sample.FullName)
 
     $drioLogDir = $null
@@ -1168,29 +1275,30 @@ try {
                 Write-RunnerLog ("created .exe copy for extensionless DRIO sample: {0}" -f $launchPath)
             }
 
-            $drrunArgs = @(
-                "-c32", "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll",
-                "-c64", "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll",
-                "-dump_text",
-                "-logdir", $drioLogDir,
-                "-logprefix", "shrike"
-            )
-            if ($bypassAntidebug) {
-                $drrunArgs += "-bypass_antidebug"
-            }
-            $drrunArgs += @("--", $launchPath)
-
             $drrunStdoutPath = Join-Path $stagingDir "drrun_stdout.txt"
             $drrunStderrPath = Join-Path $stagingDir "drrun_stderr.txt"
+            $drioRuntimePathEntries = Get-DrioRuntimePathEntries -DrrunPath $drrunPath -ClientDll $clientDll -Is32Bit $is32bit
+            $drioRuntimePath = ($drioRuntimePathEntries -join ";")
+            $bypassAntidebugEffective = $bypassAntidebug
+            $drrunArgs = New-DrioTraceArguments -Is32Bit $is32bit -DrioLogDir $drioLogDir -LaunchPath $launchPath -BypassAntidebug $bypassAntidebugEffective
             Write-RunnerLog ("launching via drrun: {0} {1}" -f $drrunPath, ($drrunArgs -join " "))
-            $proc = Start-Process -FilePath $drrunPath -ArgumentList @(
-                "-c32", "C:\Sandbox\runtime\drio\bin32\shrike_drcov_nudge.dll",
-                "-c64", "C:\Sandbox\runtime\drio\bin64\shrike_drcov_nudge.dll",
-                "-dump_text",
-                "-logdir", $drioLogDir,
-                "-logprefix", "shrike",
-                "--", $launchPath
-            ) -RedirectStandardOutput $drrunStdoutPath -RedirectStandardError $drrunStderrPath -PassThru
+            $proc = Start-DrioTraceProcess -DrrunPath $drrunPath -DrrunArgs $drrunArgs -DrrunStdoutPath $drrunStdoutPath -DrrunStderrPath $drrunStderrPath -DrioRuntimePath $drioRuntimePath
+            Start-Sleep -Seconds 2
+            if ($bypassAntidebugEffective -and (Test-DrioClientInitializerFailure -DrrunStderrPath $drrunStderrPath)) {
+                Write-RunnerLog "retrying DRIO launch without -bypass_antidebug after client initializer failure"
+                try {
+                    if ($proc -and -not $proc.HasExited) {
+                        Stop-TraceLauncherProcessTree -LauncherProcessId $proc.Id -SampleName $sample.Name
+                        $null = Wait-ProcessExit -ProcessId $proc.Id -TimeoutSeconds 5
+                    }
+                } catch {}
+                $bypassAntidebugEffective = $false
+                $drrunStdoutPath = Join-Path $stagingDir "drrun_stdout_retry_no_antidebug.txt"
+                $drrunStderrPath = Join-Path $stagingDir "drrun_stderr_retry_no_antidebug.txt"
+                $drrunArgs = New-DrioTraceArguments -Is32Bit $is32bit -DrioLogDir $drioLogDir -LaunchPath $launchPath -BypassAntidebug $bypassAntidebugEffective
+                Write-RunnerLog ("launching via drrun retry: {0} {1}" -f $drrunPath, ($drrunArgs -join " "))
+                $proc = Start-DrioTraceProcess -DrrunPath $drrunPath -DrrunArgs $drrunArgs -DrrunStdoutPath $drrunStdoutPath -DrrunStderrPath $drrunStderrPath -DrioRuntimePath $drioRuntimePath
+            }
         } else {
             Write-RunnerLog ("drrun or client DLL not found (drrun={0} client={1}); launching sample directly" -f $drrunPath, $clientDll)
             $launchPath = $sample.FullName
@@ -1221,6 +1329,7 @@ try {
         sample_size = $sample.Length
         launched_pid = $proc.Id
         execution_window_seconds = $executionWindowSeconds
+        bypass_antidebug_effective = $bypassAntidebugEffective
     }
     $sampleMetadataArtifact = New-TextResultArtifact -Name "sample_metadata.json" -Content (ConvertTo-JsonText -InputObject $sampleMetadata)
     $bufferedResultArtifacts += $sampleMetadataArtifact
@@ -1230,11 +1339,12 @@ try {
         $bufferedResultArtifacts += $taskProfileArtifact
     }
 
+    $taskRuntimeContext.bypass_antidebug_effective = $bypassAntidebugEffective
     $taskRuntimeContextArtifact = New-TextResultArtifact -Name "task_runtime_context.json" -Content (ConvertTo-JsonText -InputObject $taskRuntimeContext)
     $bufferedResultArtifacts += $taskRuntimeContextArtifact
 
     if (-not $deferTraceExport) {
-        $traceArtifactBuffer = Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+        $traceArtifactBuffer = Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebugEffective
         Save-RunnerLogSnapshot -Destination (Join-Path $stagingDir "runner.log")
     }
 
@@ -1262,8 +1372,8 @@ try {
         Restore-TraceBackendScriptIfMissing -TraceBackendScriptPath $traceBackendScript
         # Contract anchor: DRIO export happens after Stop-TraceLauncherProcessTree and before Sysmon collection.
         # Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $artifactDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd
-        # Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
-        $traceArtifactBuffer = Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebug
+        # Export-TraceArtifacts -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -ArtifactDir $stagingDir -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebugEffective
+        $traceArtifactBuffer = Capture-TraceArtifactsToBuffer -TaskProfile $taskProfile -TaskRuntimeContext $taskRuntimeContext -SampleName $sample.Name -SamplePath $sample.FullName -LaunchedPid $proc.Id -StartedAt $start -EndedAt $plannedTraceEnd -DrioLogDir $drioLogDir -BypassAntidebug $bypassAntidebugEffective
         Write-TraceArtifactBuffer -TraceArtifactBuffer $traceArtifactBuffer -ArtifactDir $stagingDir
         Save-RunnerLogSnapshot -Destination (Join-Path $stagingDir "runner.log")
         Publish-StagingArtifacts -StagingDir $stagingDir -ArtifactDir $artifactDir -Reason "after trace export"

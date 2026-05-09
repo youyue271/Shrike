@@ -463,6 +463,20 @@ class TaskProfileValidationTests(unittest.TestCase):
 
         self.assertEqual(timeout_seconds, 510)
 
+    def test_recommended_timeout_seconds_accounts_for_trace_processing_budget(self) -> None:
+        timeout_seconds = recommended_timeout_seconds(
+            {
+                "profile_name": "deep_cfg_drio_extended",
+                "trace_mode": "dynamic_cfg",
+                "trace_backend": "drio",
+                "execution_window_seconds": 180,
+                "boot_stabilization_seconds": 30,
+                "trace_processing_timeout_seconds": 600,
+            }
+        )
+
+        self.assertEqual(timeout_seconds, 1110)
+
     def test_recommended_timeout_seconds_falls_back_to_default_without_profile(self) -> None:
         self.assertEqual(recommended_timeout_seconds(None), 300)
 
@@ -503,15 +517,69 @@ class GuestRuntimeTraceTimingTests(unittest.TestCase):
         self.assertIn("function Get-DrioDrrunPath {", script)
         self.assertIn("function Get-DrioClientRuntimePaths {", script)
         self.assertIn('$drioLogDir = Join-Path $artifactDir "drio"', script)
-        self.assertIn('$proc = Start-Process -FilePath $drrunPath -ArgumentList @(', script)
-        self.assertIn('"-c32"', script)
-        self.assertIn('"-c64"', script)
-        self.assertIn('"C:\\Sandbox\\runtime\\drio\\bin32\\shrike_drcov_nudge.dll"', script)
-        self.assertIn('"C:\\Sandbox\\runtime\\drio\\bin64\\shrike_drcov_nudge.dll"', script)
+        self.assertIn('return Start-Process -FilePath $DrrunPath -ArgumentList $DrrunArgs', script)
+        self.assertIn("function Get-DrioRuntimePathEntries {", script)
+        self.assertIn("$drioRuntimePathEntries = Get-DrioRuntimePathEntries -DrrunPath $drrunPath -ClientDll $clientDll -Is32Bit $is32bit", script)
+        self.assertIn('$drioRuntimePath = ($drioRuntimePathEntries -join ";")', script)
+        self.assertIn('$oldPath = $env:PATH', script)
+        self.assertIn('$env:PATH = "$DrioRuntimePath;$oldPath"', script)
+        self.assertIn('$env:PATH = $oldPath', script)
+        self.assertIn('"-c32", "C:\\Sandbox\\runtime\\drio\\bin32\\shrike_drcov_nudge.dll"', script)
+        self.assertIn('"-c64", "C:\\Sandbox\\runtime\\drio\\bin64\\shrike_drcov_nudge.dll"', script)
         self.assertIn('"-dump_text"', script)
         self.assertIn('"-logdir"', script)
         self.assertIn('"-logprefix"', script)
         self.assertIn('launcher = if ($deferTraceExport) { "drrun_custom_drcov_client" } else { "direct" }', script)
+
+    def test_run_task_uses_matching_drrun_and_client_bitness(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+        drrun_body = script[
+            script.index("function Get-DrioDrrunPath {") :
+            script.index("function Get-DrioDrconfigPath {")
+        ]
+        args_body = script[
+            script.index("function New-DrioTraceArguments {") :
+            script.index("function Start-DrioTraceProcess {")
+        ]
+
+        self.assertIn('if ($Is32Bit) {', drrun_body)
+        self.assertLess(
+            drrun_body.index('if ($Is32Bit) {'),
+            drrun_body.index('return "C:\\Tools\\DynamoRIO\\bin32\\drrun.exe"'),
+        )
+        self.assertIn('return "C:\\Tools\\DynamoRIO\\bin64\\drrun.exe"', drrun_body)
+        self.assertIn('$args = if ($Is32Bit) {', args_body)
+        self.assertIn('@("-c32", "C:\\Sandbox\\runtime\\drio\\bin32\\shrike_drcov_nudge.dll")', args_body)
+        self.assertIn('@("-c64", "C:\\Sandbox\\runtime\\drio\\bin64\\shrike_drcov_nudge.dll")', args_body)
+
+    def test_run_task_retries_drio_without_antidebug_when_client_initializer_fails(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Start-DrioTraceProcess {", script)
+        self.assertIn("function Test-DrioClientInitializerFailure {", script)
+        self.assertIn('library initializer failed', script)
+        self.assertIn('retrying DRIO launch without -bypass_antidebug after client initializer failure', script)
+        self.assertIn('$bypassAntidebugEffective = $false', script)
+        self.assertIn('$taskRuntimeContext.bypass_antidebug_effective = $bypassAntidebugEffective', script)
+        self.assertIn('bypass_antidebug_effective = $bypassAntidebugEffective', script)
+
+    def test_run_task_does_not_hide_custom_client_initializer_failure_with_stock_drcov(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertNotIn("function New-DrioStockDrcovArguments {", script)
+        self.assertNotIn("Get-DrioStockDrcovClientPath -DrrunPath $drrunPath", script)
+        self.assertNotIn('falling back to stock DynamoRIO drcov client after custom client initializer failure', script)
+        self.assertNotIn('drrun_stdout_stock_drcov.txt', script)
+        self.assertNotIn('drrun_stderr_stock_drcov.txt', script)
+
+    def test_windows_batch_requires_custom_control_flow_trace(self) -> None:
+        script = (REPO_ROOT / "windows_host" / "powershell" / "13_batch_sandbox_wrapped.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('$HealthyTraceStatuses = @("control_flow_trace", "completed")', script)
+        self.assertNotIn('"drcov_basic_blocks", "completed"', script)
+        self.assertIn("if ($health.Healthy) {", script)
+        self.assertIn("wrapper_exit_code = $lastRun.ExitCode", script)
+        self.assertNotIn("if ($lastRun.ExitCode -eq 0 -and $health.Healthy)", script)
 
     def test_run_task_defers_drio_trace_export_until_after_sleep(self) -> None:
         script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
@@ -550,8 +618,10 @@ class GuestRuntimeTraceTimingTests(unittest.TestCase):
     def test_run_task_attempts_drio_nudge_before_taskkill_shutdown(self) -> None:
         script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
 
+        self.assertIn("function Get-DrioDrconfigPath {", script)
         self.assertIn("function Invoke-DrioNudgeForTraceTargets {", script)
-        self.assertIn('"-nudge"', script)
+        self.assertIn('$drconfigPath = Get-DrioDrconfigPath -DrrunPath $drrunPath', script)
+        self.assertIn('& $drconfigPath "-nudge" $targetName "0" "1"', script)
         self.assertIn("Invoke-DrioNudgeForTraceTargets -SampleName $SampleName -TreeIds $treeIds", script)
         self.assertLess(
             script.index("Invoke-DrioNudgeForTraceTargets -SampleName $SampleName -TreeIds $treeIds"),
@@ -633,10 +703,10 @@ class GuestRuntimeTraceTimingTests(unittest.TestCase):
 
         self.assertIn('$launchPath = $sample.FullName', script)
         self.assertIn('created .exe copy for extensionless DRIO sample', script)
-        self.assertIn('$drrunArgs += @("--", $launchPath)', script)
+        self.assertIn('$args += @("--", $LaunchPath)', script)
         self.assertLess(
             script.index('created .exe copy for extensionless DRIO sample'),
-            script.index('$drrunArgs += @("--", $launchPath)'),
+            script.index('$drrunArgs = New-DrioTraceArguments'),
         )
 
     def test_drio_client_matches_extensionless_sample_and_renamed_client_modules(self) -> None:
@@ -695,9 +765,26 @@ class GuestRuntimeInstallTests(unittest.TestCase):
         self.assertIn('$TraceBackendDrioSourcePath = Resolve-ProjectPath -Path $TraceBackendDrioSourcePath -RepoRoot $repoRoot', script)
         self.assertIn('$traceBackendDrioContent = Get-Content -Path $TraceBackendDrioSourcePath -Raw -Encoding UTF8', script)
         self.assertIn('Set-Content -Path "C:\\Sandbox\\runtime\\trace_backend_drio.ps1" -Value $TraceBackendDrioContent -Encoding UTF8', script)
-        self.assertIn('"drmgr.dll", "drutil.dll", "drwrap.dll"', script)
+        self.assertIn('Enable-ScheduledTask -TaskName $ScheduledTaskName | Out-Null', script)
+        self.assertIn('"dynamorio.dll", "drmgr.dll", "drutil.dll", "drwrap.dll"', script)
+        self.assertIn('$runtimeSourceDir = Join-Path $GuestInstallRoot ("lib{0}\\release" -f $libSuffix)', script)
+        self.assertIn('$extensionSourceDir = Join-Path $GuestInstallRoot ("ext\\lib{0}\\release" -f $libSuffix)', script)
         self.assertIn('Copy-DrioClientDependencies -Bitness "bin32"', script)
         self.assertIn('Copy-DrioClientDependencies -Bitness "bin64"', script)
+
+    def test_run_task_adds_drio_extension_dependency_dirs_to_path(self) -> None:
+        script = (REPO_ROOT / "guest" / "runtime" / "run_task.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('(Join-Path $drioRoot ("lib{0}\\release" -f $libSuffix))', script)
+        self.assertIn('(Join-Path $drioRoot ("ext\\lib{0}\\release" -f $libSuffix))', script)
+        self.assertIn('Get-DrioRuntimePathEntries -DrrunPath $drrunPath -ClientDll $clientDll -Is32Bit $is32bit', script)
+        self.assertIn('($drioRuntimePathEntries -join ";")', script)
+
+    def test_drio_client_unregisters_instruction_callback_with_existing_api_contract(self) -> None:
+        source = (REPO_ROOT / "windows_host" / "drio_client" / "src" / "shrike_drcov_nudge.c").read_text(encoding="utf-8")
+
+        self.assertIn("drmgr_register_bb_instrumentation_event(NULL, event_app_instruction, NULL)", source)
+        self.assertIn("drmgr_unregister_bb_instrumentation_event(event_app_instruction)", source)
 
 
 class DrioBackendTests(unittest.TestCase):
@@ -812,13 +899,27 @@ class DrioClientBuildTests(unittest.TestCase):
 
         self.assertIn('[string]$DynamoRIOZipPath = "windows_host\\third_party\\DynamoRIO-Windows.zip"', script)
         self.assertIn('[string]$ClientSourcePath = "windows_host\\drio_client\\src\\shrike_drcov_nudge.c"', script)
-        self.assertIn("vcvarsall.bat", script)
-        self.assertIn("dynamorio.lib", script)
-        self.assertIn("drmgr.lib", script)
-        self.assertIn("drutil.lib", script)
-        self.assertIn("drwrap.lib", script)
+        self.assertIn("cmake.exe", script)
+        self.assertIn('set(CMAKE_CONFIGURATION_TYPES "RelWithDebInfo" CACHE STRING "" FORCE)', script)
+        self.assertIn("set(DynamoRIO_USE_LIBC OFF)", script)
+        self.assertIn('set(PREFERRED_BASE 0x72000000)', script)
+        self.assertIn('configure_DynamoRIO_global(OFF ON)', script)
+        self.assertIn('set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /GS- /wd4100 /wd4127 /wd4054")', script)
+        self.assertIn("configure_DynamoRIO_client(shrike_drcov_nudge)", script)
+        self.assertIn("use_DynamoRIO_extension(shrike_drcov_nudge drmgr)", script)
+        self.assertIn("use_DynamoRIO_extension(shrike_drcov_nudge drutil)", script)
+        self.assertIn("use_DynamoRIO_extension(shrike_drcov_nudge drwrap)", script)
+        self.assertIn('/SUBSYSTEM:CONSOLE,5.02 /OSVERSION:5.02 /GUARD:NO', script)
+        self.assertNotIn("/GUARD:CF-", script)
+        self.assertNotIn("/GUARD:EHCONT-", script)
+        self.assertNotIn("/CETCOMPAT:NO", script)
+        self.assertIn("find_package(DynamoRIO REQUIRED)", script)
+        self.assertIn("DynamoRIO_DIR", script)
+        self.assertNotIn("target_link_libraries(shrike_drcov_nudge ws2_32)", script)
+        self.assertNotIn("target_link_libraries(shrike_drcov_nudge drmgr drutil drwrap ws2_32)", script)
         self.assertIn("bin32\\release\\shrike_drcov_nudge.dll", script)
         self.assertIn("bin64\\release\\shrike_drcov_nudge.dll", script)
+        self.assertNotIn("cl.exe /nologo /LD /O2 /MT", script)
 
     def test_custom_drio_client_registers_nudge_callback_and_uses_drmgr(self) -> None:
         script = (REPO_ROOT / "windows_host" / "drio_client" / "src" / "shrike_drcov_nudge.c").read_text(encoding="utf-8")
@@ -831,6 +932,18 @@ class DrioClientBuildTests(unittest.TestCase):
         self.assertIn("wrap_K32EnumProcessModules_post", script)
         self.assertIn('g_enable_peb_unlinking = has_client_option(argc, argv, "-enable_peb_unlinking")', script)
         self.assertIn("PEB unlinking disabled", script)
+
+    def test_custom_drio_client_does_not_link_dead_result_server_socket_path(self) -> None:
+        source = (REPO_ROOT / "windows_host" / "drio_client" / "src" / "shrike_drcov_nudge.c").read_text(encoding="utf-8")
+        build_script = (REPO_ROOT / "windows_host" / "powershell" / "11_build_drio_nudge_client.ps1").read_text(encoding="utf-8")
+
+        self.assertNotIn("#include <winsock2.h>", source)
+        self.assertNotIn("#include <ws2tcpip.h>", source)
+        self.assertNotIn("WSAStartup", source)
+        self.assertNotIn("result_server", source)
+        self.assertNotIn("result_socket", source)
+        self.assertNotIn("send(data->result_socket", source)
+        self.assertNotIn("target_link_libraries(shrike_drcov_nudge ws2_32)", build_script)
 
     def test_custom_drio_client_has_execution_triggered_dump_fallback(self) -> None:
         script = (REPO_ROOT / "windows_host" / "drio_client" / "src" / "shrike_drcov_nudge.c").read_text(encoding="utf-8")
@@ -854,7 +967,6 @@ class DrioClientBuildTests(unittest.TestCase):
     def test_custom_drio_client_flushes_sample_cfg_events_immediately(self) -> None:
         script = (REPO_ROOT / "windows_host" / "drio_client" / "src" / "shrike_drcov_nudge.c").read_text(encoding="utf-8")
 
-        self.assertIn("data->result_socket_disabled", script)
         self.assertIn("if (should_trace_interesting_pc(source))", script)
         self.assertIn("flush_trace_buffer(drcontext, data);", script)
 
@@ -917,6 +1029,20 @@ class OfflineTaskTimeoutBudgetTests(unittest.TestCase):
 
         self.assertIn("if args.timeout_seconds is not None:", script)
         self.assertIn('run_cmd.extend(["--timeout-seconds", str(args.timeout_seconds)])', script)
+
+    def test_windows_batch_runner_keeps_powershell_orchestration_on_windows_side(self) -> None:
+        script = (REPO_ROOT / "windows_host" / "powershell" / "13_batch_sandbox_wrapped.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("12_run_sandbox_wrapped.ps1", script)
+        self.assertIn("Get-RecommendedTimeoutSeconds", script)
+        self.assertIn("$effectiveTimeoutSeconds = [Math]::Max($TimeoutSeconds, $recommendedTimeoutSeconds)", script)
+        self.assertIn("$effectiveWallTimeoutSeconds = [Math]::Max($WallTimeoutSeconds, ($effectiveTimeoutSeconds + 300))", script)
+        self.assertIn("requested TimeoutSeconds={0} is below profile budget {1}; using {2}", script)
+        self.assertIn("batch_manifest.jsonl", script)
+        self.assertIn("batch_errors.jsonl", script)
+        self.assertIn("Test-TraceHealth", script)
+        self.assertIn("Copy-WhitelistedArtifacts", script)
+        self.assertIn('Start-Process -FilePath "powershell.exe"', script)
 
 
 class RawArtifactCopyTests(unittest.TestCase):

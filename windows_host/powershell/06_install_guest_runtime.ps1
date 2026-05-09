@@ -148,6 +148,8 @@ try {
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
         Register-ScheduledTask -TaskName $ScheduledTaskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
+        Enable-ScheduledTask -TaskName $ScheduledTaskName | Out-Null
+        $scheduledTaskState = (Get-ScheduledTask -TaskName $ScheduledTaskName).State.ToString()
 
         $sysmonExe = $null
         $sysmonCandidates = @(
@@ -235,6 +237,7 @@ try {
             TraceBackendDrioPath = "C:\Sandbox\runtime\trace_backend_drio.ps1"
             SysmonConfigPath = "C:\Sandbox\runtime\sysmon_config.xml"
             TaskName = $ScheduledTaskName
+            TaskState = $scheduledTaskState
             RuntimeSize = (Get-Item "C:\Sandbox\runtime\run_task.ps1").Length
             LastWriteTime = (Get-Item "C:\Sandbox\runtime\run_task.ps1").LastWriteTime
             ProjectSysmonPath = $projectSysmonPath
@@ -268,12 +271,19 @@ try {
                 [string]$Bitness
             )
 
-            $dependencyNames = @("drmgr.dll", "drutil.dll", "drwrap.dll")
-            $sourceDir = Join-Path $GuestInstallRoot ("ext\lib{0}\release" -f $Bitness.Substring(3))
+            $libSuffix = $Bitness.Substring(3)
+            $runtimeSourceDir = Join-Path $GuestInstallRoot ("lib{0}\release" -f $libSuffix)
+            $extensionSourceDir = Join-Path $GuestInstallRoot ("ext\lib{0}\release" -f $libSuffix)
             $destinationDir = Join-Path "C:\Sandbox\runtime\drio" $Bitness
+            $dependencySources = @{
+                "dynamorio.dll" = $runtimeSourceDir
+                "drmgr.dll" = $extensionSourceDir
+                "drutil.dll" = $extensionSourceDir
+                "drwrap.dll" = $extensionSourceDir
+            }
 
-            foreach ($dependencyName in $dependencyNames) {
-                $sourcePath = Join-Path $sourceDir $dependencyName
+            foreach ($dependencyName in @("dynamorio.dll", "drmgr.dll", "drutil.dll", "drwrap.dll")) {
+                $sourcePath = Join-Path $dependencySources[$dependencyName] $dependencyName
                 if (-not (Test-Path $sourcePath)) {
                     throw "Required DynamoRIO extension dependency not found: $sourcePath"
                 }
@@ -296,7 +306,7 @@ try {
     Write-Log -Message ("Installed trace backend placeholder to {0}" -f $result.TraceBackendPlaceholderPath) -LogPath $logPath
     Write-Log -Message ("Installed trace backend drio to {0}" -f $result.TraceBackendDrioPath) -LogPath $logPath
     Write-Log -Message ("Installed Sysmon config to {0}" -f $result.SysmonConfigPath) -LogPath $logPath
-    Write-Log -Message ("Registered startup task {0}" -f $result.TaskName) -LogPath $logPath
+    Write-Log -Message ("Registered startup task {0}; state={1}" -f $result.TaskName, $result.TaskState) -LogPath $logPath
     Write-Log -Message ("Guest runtime size={0} bytes, lastWriteTime={1}" -f $result.RuntimeSize, $result.LastWriteTime) -LogPath $logPath
     Write-Log -Message ("ProjectSysmonPath={0}; SysmonInstalledFromProject={1}" -f $result.ProjectSysmonPath, $result.SysmonInstalledFromProject) -LogPath $logPath
     Write-Log -Message ("SysmonCommandExitCode={0}; stdout={1}; stderr={2}" -f $result.SysmonCommandExitCode, $result.SysmonCommandStdOut, $result.SysmonCommandStdErr) -LogPath $logPath

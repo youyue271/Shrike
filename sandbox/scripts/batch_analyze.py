@@ -104,11 +104,80 @@ def stable_key(profile_name: str, sha12: str) -> str:
     return f"{profile_name}_{sha12}"
 
 
-def existing_runs(results_root: Path, key: str) -> list[Path]:
+def existing_runs(results_root: Path, key: str, root: Path) -> list[Path]:
     base = results_root / key
     if not base.is_dir():
         return []
-    return [p for p in sorted(base.iterdir()) if p.is_dir() and (p / "raw" / "dynamic_cfg_trace.ndjson").is_file()]
+    healthy = []
+    for ts_dir in sorted(base.iterdir()):
+        if not ts_dir.is_dir():
+            continue
+        ok, _ = trace_health(ts_dir)
+        if ok:
+            healthy.append(ts_dir)
+    return healthy
+
+
+HEALTHY_TRACE_STATUSES = {"control_flow_trace", "completed"}
+
+
+def drrun_stderr_hint(report_dir: Path) -> str | None:
+    stderr_path = report_dir / "raw" / "drrun_stderr.txt"
+    if not stderr_path.is_file():
+        return None
+    text = stderr_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+    if not text:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    for line in lines:
+        lower = line.lower()
+        if "incompatible api version" in lower or "should be re-compiled" in lower:
+            return line
+    return lines[-1]
+
+
+def trace_health(report_dir: Path) -> tuple[bool, str]:
+    """Return (healthy, detail). A run is healthy only when the trace manifest
+    reports a real CFG. `seeded_from_runtime_metadata` is a graceful fallback
+    that contains only the PE entry-point seed and is treated as failure."""
+    trace_ndjson = report_dir / "raw" / "dynamic_cfg_trace.ndjson"
+    if not trace_ndjson.is_file():
+        return False, "dynamic_cfg_trace.ndjson missing"
+    manifest = report_dir / "raw" / "trace_manifest.json"
+    if not manifest.is_file():
+        return False, "trace_manifest.json missing"
+    try:
+        status = json.loads(manifest.read_text(encoding="utf-8-sig")).get("status", "<unknown>")
+    except Exception as exc:
+        return False, f"trace_manifest unreadable: {exc}"
+    if status in HEALTHY_TRACE_STATUSES:
+        return True, status
+    detail = f"trace_status={status}"
+    stderr_hint = drrun_stderr_hint(report_dir)
+    if stderr_hint:
+        detail = f"{detail} drrun_stderr={stderr_hint}"
+    return False, detail
+
+
+TERMINAL_DRRUN_FAILURE_PATTERNS = (
+    "unable to load client library",
+    "library initializer failed",
+    "incompatible api version",
+    "should be re-compiled",
+    "wrong architecture",
+    "registration failed with error code 15",
+)
+
+
+def is_terminal_drrun_failure(detail: str | None) -> bool:
+    if not detail:
+        return False
+    lower = detail.lower()
+    if "drrun_stderr=" not in lower:
+        return False
+    return any(pattern in lower for pattern in TERMINAL_DRRUN_FAILURE_PATTERNS)
 
 
 def run_wrapper(
@@ -136,7 +205,15 @@ def run_wrapper(
         "-TimeoutSeconds",
         str(timeout_seconds),
     ]
-    return subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=wall_timeout_seconds)
+    return subprocess.run(
+        cmd,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=wall_timeout_seconds,
+    )
 
 
 def win_path(p: Path) -> str:
@@ -212,7 +289,7 @@ def process_sample(
     key = stable_key(profile_name, sha12)
 
     if not force:
-        runs = existing_runs(results_root, key)
+        runs = existing_runs(results_root, key, root)
         if runs:
             return RunResult(
                 status="skipped",
@@ -232,8 +309,10 @@ def process_sample(
     error = None
     last_stdout = ""
     last_stderr = ""
+    attempts_used = 0
     start = time.monotonic()
     for attempt in (1, 2):
+        attempts_used = attempt
         try:
             if attempt == 2:
                 stop_vm(vm_name)
@@ -241,7 +320,8 @@ def process_sample(
             completed = run_wrapper(root, sample, task_profile, report_id, timeout_seconds, wall_timeout_seconds)
             last_stdout = completed.stdout or ""
             last_stderr = completed.stderr or ""
-            if completed.returncode == 0 and (report_dir / "raw" / "dynamic_cfg_trace.ndjson").is_file():
+            healthy, health_detail = trace_health(report_dir)
+            if completed.returncode == 0 and healthy:
                 duration = time.monotonic() - start
                 dest = results_root / key / timestamp
                 dest.mkdir(parents=True, exist_ok=True)
@@ -259,6 +339,7 @@ def process_sample(
                     "timestamp_utc": timestamp,
                     "duration_seconds": round(duration, 2),
                     "attempts": attempt,
+                    "trace_status": health_detail,
                     "whitelist_copied": copied,
                     "whitelist_missing": missing,
                 }, ensure_ascii=False) + "\n")
@@ -273,7 +354,9 @@ def process_sample(
                     stdout_tail=None,
                     stderr_tail=None,
                 )
-            error = f"exit={completed.returncode} trace_missing={not (report_dir / 'raw' / 'dynamic_cfg_trace.ndjson').is_file()}"
+            error = f"exit={completed.returncode} health={health_detail}"
+            if is_terminal_drrun_failure(error):
+                break
         except subprocess.TimeoutExpired:
             error = f"wall_timeout_{wall_timeout_seconds}s"
             stop_vm(vm_name)
@@ -291,7 +374,7 @@ def process_sample(
         "report_id": report_id,
         "timestamp_utc": timestamp,
         "duration_seconds": round(duration, 2),
-        "attempts": 2,
+        "attempts": attempts_used,
         "error": error,
         "stdout_tail": tail(last_stdout),
         "stderr_tail": tail(last_stderr),
@@ -302,7 +385,7 @@ def process_sample(
         report_id=report_id,
         report_dir=report_dir,
         duration_seconds=duration,
-        attempts=2,
+        attempts=attempts_used,
         error=error,
         stdout_tail=tail(last_stdout),
         stderr_tail=tail(last_stderr),

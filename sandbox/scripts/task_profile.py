@@ -67,12 +67,21 @@ def recommended_timeout_seconds(
     trace_backend = str(task_profile.get("trace_backend", "none") or "none")
     execution_window_seconds = _coerce_nonnegative_int(task_profile.get("execution_window_seconds"), 0)
     boot_stabilization_seconds = _coerce_nonnegative_int(task_profile.get("boot_stabilization_seconds"), 0)
+    trace_processing_timeout_seconds = _coerce_nonnegative_int(
+        task_profile.get("trace_processing_timeout_seconds"), 0
+    )
     export_slack_seconds = (
         artifact_export_slack_seconds
         + TRACE_MODE_EXPORT_SLACK_SECONDS.get(trace_mode, 0)
         + TRACE_BACKEND_EXPORT_SLACK_SECONDS.get(trace_backend, 0)
     )
-    recommended = vm_boot_grace_seconds + boot_stabilization_seconds + execution_window_seconds + export_slack_seconds
+    recommended = (
+        vm_boot_grace_seconds
+        + boot_stabilization_seconds
+        + execution_window_seconds
+        + trace_processing_timeout_seconds
+        + export_slack_seconds
+    )
     return max(default_timeout_seconds, recommended)
 
 
